@@ -24,14 +24,16 @@
 # 	${RM} *.o
 #
 
-all: server
+all: server client clear
 
 
 server: server.o
 	gcc -o server server.o -lpthread
+client: client.o
+	gcc -o client client.o -lpthread
 
 server.o: server.c
-
+client.o: client.c
 
 clear:
 	rm -v *.o
