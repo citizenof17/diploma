@@ -26,7 +26,6 @@
 
 all: server client clear
 
-
 server: server.o
 	gcc -o server server.o -lpthread
 client: client.o

@@ -36,8 +36,10 @@ typedef struct client_params_t {
 } client_params_t;
 
 void *rpc_handler(void *arg) {
-    client_params_t client_params = *(client_params_t *)arg;
-    pthread_mutex_unlock (&client_params.mutex);
+    
+    client_params_t *_client_params = arg;
+    client_params_t client_params = *_client_params;
+    pthread_mutex_unlock (&_client_params->mutex);
     command_t query;
     response_t response;
     
@@ -92,7 +94,7 @@ int run_server(config_t *config) {
 
     int i = 0;
     int n = 5;
-    for (i; i < n; ++i){
+    while (1){
         struct sockaddr client_name;
         socklen_t client_name_len;
         // client connected
@@ -106,10 +108,11 @@ int run_server(config_t *config) {
         // creating a thread 
         pthread_t thread;
         client_params.fd = fd;
-        int rv = pthread_create (&thread, NULL, rpc_handler, &client_params);
+        int rv = pthread_create(&thread, NULL, rpc_handler, &client_params);
         if (rv == 0){
-            pthread_mutex_lock (&client_params.mutex);
+            pthread_mutex_lock(&client_params.mutex);
         }
+        fflush(stdin);
     }
 }
 

@@ -70,6 +70,7 @@ void * run_client(void * arg){
     }
     
     printf("Recv success\n");
+    printf("Recieved %d\n", response.val);
     close(sock);
     return ((void *)EXIT_SUCCESS);
 }
