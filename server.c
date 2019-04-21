@@ -1,5 +1,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <inttypes.h>
 #include <unistd.h>
@@ -16,10 +19,11 @@
 #define IP_ADDR ("127.0.0.1")
 #define MAX_CLIENTS (5)
 #define NUMBER_OF_PORTS (2)
+#define SELECT_TIMEOUT (3)
 
 int CURRENT_SERVER = DEFAULT_PORT;
 int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501};
-
+int leader = 0;
 
 typedef struct command_t {
     int val;
@@ -46,8 +50,8 @@ typedef struct client_params_t {
 typedef struct server_params_t {
     config_t *config;
     int fd;
-    ptread_mutex_t mutex;
-} server_data_t;
+    pthread_mutex_t mutex;
+} server_params_t;
 
 void *rpc_handler(void *arg) {
     client_params_t *_client_params = arg;
@@ -159,11 +163,13 @@ int run_server(config_t *config) {
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    int sock_out = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0 || sock_out < 0) {
+    // int sock_out = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
         perror ("ошибка вызова socket");
         return (EXIT_FAILURE);
     }
+
+    fcntl(sock, F_SETFL, O_NONBLOCK);
 
     rc = bind(sock, (struct sockaddr *)&local, sizeof(local));
     if (rc < 0) {
@@ -178,31 +184,56 @@ int run_server(config_t *config) {
         return (EXIT_FAILURE);
     }
 
-    fflush(stdout);
-    clock_t start = clock();
-    double timeout = 30;
     while (1){
         if (!leader){
             // wait for incoming messages from leader/client (it might be hearbeats)
+            fd_set sockets;
+            FD_ZERO(&sockets);
+            FD_SET(sock, &sockets);
 
-        }
-    }
-    while (wait_for(start) < timeout){
-        server_params_t server_params = {
-            .config = config,
-        };
-
-        pthread_mutex_init(&server_params.mutex, NULL);
-        pthread_t receive_thread;
-        int rv = pthread_create(&receive_thread, NULL, receive_rpcs, &server_data);
-        int i = 0;
-        for (i; i < NUMBER_OF_PORTS; i++){
-            if (KNOWN_PORTS[i] != CURRENT_SERVER){
-                send_rpcs(sock_out, KNOWN_PORTS[i]);
+            struct timeval timeout;
+            timeout.tv_sec = SELECT_TIMEOUT;
+            timeout.tv_usec = 0;
+            printf("Entering select\n");
+            int sel = select(sock + 1, &sockets, NULL, NULL, &timeout); 
+            printf("Right after select %d\n", sel);
+            if (sel < 0){
+                perror("Ошибка select");
+                return (EXIT_FAILURE);
             }
+
+            // timeout
+            if (sel == 0){
+                continue;
+            }
+
+            
+            if (FD_ISSET(sock, &sockets)){
+                printf("In FD_ISSET\n");
+                int fd = accept(sock, NULL, NULL);
+                printf("ACCEPTED\n");
+                if (fd < 0){
+                    perror("Error in accept");
+                    return (EXIT_FAILURE);
+                }
+
+                server_params_t server_params ={
+                    .config = config,
+                    .fd = fd,
+                };
+                pthread_t thread;
+                int rv = pthread_create(&thread, NULL, rpc_handler, &server_params);
+                if (rv == 0){
+                    //lock mutex
+                }
+            }
+            printf("AFTER ACCEPT\n");
+        }
+        else{
+            // leader actions
         }
     }
-    close(sock);
+    //close(sock);
 }
 
 int parse_str(int *num, char *str){
