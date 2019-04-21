@@ -4,6 +4,7 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <unistd.h>
 #include <inttypes.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -24,6 +25,16 @@
 int CURRENT_SERVER = DEFAULT_PORT;
 int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501};
 int leader = 0;
+
+int current_term = 0;
+int voted_for = 0;
+int *log = NULL;
+
+int commit_index = 0;
+int last_applied = 0;
+
+int *next_index = NULL;
+int *match_index = NULL;
 
 typedef struct command_t {
     int val;
@@ -52,6 +63,32 @@ typedef struct server_params_t {
     int fd;
     pthread_mutex_t mutex;
 } server_params_t;
+
+void request_vote(int port, response_t *response){
+
+}
+
+void initiate_election(config_t *config){
+    printf("Initiate election\n");
+    current_term++;
+    voted_for = CURRENT_SERVER;
+    //reset election timer? 
+
+    int i = 0;
+    for (i; i < NUMBER_OF_PORTS; i++){
+        int votes = 0;
+        if (KNOWN_PORTS[i] != CURRENT_SERVER){
+            response_t response;
+            request_vote(KNOWN_PORTS[i], &response);
+            votes += response.val;
+        }
+    }
+
+    if (CURRENT_SERVER & 1){
+        leader = 1;
+    }
+    printf("LEADER %d\n", leader);
+}
 
 void *rpc_handler(void *arg) {
     client_params_t *_client_params = arg;
@@ -121,12 +158,19 @@ void *receive_rpcs(int sock, config_t *config){
     }
 }
 
-void *send_rpcs(sock, port){
+void *send_rpcs(port){
     printf("Sending rpcs\n");
     struct sockaddr_in peer;
     peer.sin_family = AF_INET;
     peer.sin_port = htons(port);
     peer.sin_addr.s_addr = inet_addr(IP_ADDR);
+
+    int sock;
+
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("ошибка вызова socket");
+        return ((void *)EXIT_FAILURE);
+    }
 
     int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
     if (rc > 0) {
@@ -137,10 +181,13 @@ void *send_rpcs(sock, port){
     printf("Connected %d\n", CURRENT_SERVER);
     response_t response;
     command_t command = {15};
+    printf("Hi1\n");
     if ((rc = send(sock, &command, sizeof(command), 0)) <= 0) {
+        printf("Hi2\n");
         perror("ошибка вызова send");
         return ((void *)EXIT_FAILURE);
     }
+    printf("Hi3\n");
 
     printf("Sent success\n");
 
@@ -149,6 +196,7 @@ void *send_rpcs(sock, port){
         return ((void *)EXIT_FAILURE);
     }
     
+    close(sock);
     printf("Recieved %d\n", response.val);
     return ((void *)EXIT_SUCCESS);
 }
@@ -202,12 +250,12 @@ int run_server(config_t *config) {
                 return (EXIT_FAILURE);
             }
 
-            // timeout
+            // timeout, initiate election
             if (sel == 0){
+                initiate_election(config);
                 continue;
             }
 
-            
             if (FD_ISSET(sock, &sockets)){
                 printf("In FD_ISSET\n");
                 int fd = accept(sock, NULL, NULL);
@@ -227,10 +275,18 @@ int run_server(config_t *config) {
                     //lock mutex
                 }
             }
-            printf("AFTER ACCEPT\n");
+
         }
         else{
+            printf("Leader actions\n");
             // leader actions
+            int i = 0;
+            for (i; i < NUMBER_OF_PORTS; i++){
+                if (KNOWN_PORTS[i] != CURRENT_SERVER){
+                    send_rpcs(KNOWN_PORTS[i]);
+                }
+            }
+            sleep(5);
         }
     }
     //close(sock);
@@ -259,11 +315,12 @@ int parse_str(int *num, char *str){
 
 int main(int argc, char * argv[]){
     parse_str(&CURRENT_SERVER, argv[1]);
-    
     config_t config = {
         .port = CURRENT_SERVER,
     };
     
+    perror("Hello perror!");
+    printf("%d\n", CURRENT_SERVER);
     int rv = run_server(&config);
     if (rv != 0){
         printf("Fail?\n");
