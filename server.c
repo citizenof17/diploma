@@ -8,10 +8,18 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #define DEFAULT_PORT (7500)
+#define BAD_PORT (1)
+#define MAX_PORT (65535)
 #define IP_ADDR ("127.0.0.1")
 #define MAX_CLIENTS (5)
+#define NUMBER_OF_PORTS (2)
+
+int CURRENT_SERVER = DEFAULT_PORT;
+int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501};
+
 
 typedef struct command_t {
     int val;
@@ -35,11 +43,16 @@ typedef struct client_params_t {
     pthread_mutex_t mutex;
 } client_params_t;
 
+typedef struct server_params_t {
+    config_t *config;
+    int fd;
+    ptread_mutex_t mutex;
+} server_data_t;
+
 void *rpc_handler(void *arg) {
-    
     client_params_t *_client_params = arg;
     client_params_t client_params = *_client_params;
-    pthread_mutex_unlock (&_client_params->mutex);
+    pthread_mutex_unlock(&_client_params->mutex);
     command_t query;
     response_t response;
     
@@ -59,18 +72,95 @@ void *rpc_handler(void *arg) {
     }  
 }
 
+double wait_for(clock_t start_time){
+    return (clock() - start_time) / CLOCKS_PER_SEC;
+}
+
+void *receive_rpcs(int sock, config_t *config){
+    // In `timeout` try to get incoming calls
+    // for each call create a thread
+    // if thread is not freeing the mutex in `thread_timeout` - kill the thread and unlock the mutex
+    printf("Receiving rpcs\n");
+    clock_t start_time = clock();
+    double timeout = 0.5;
+    double thread_timeout = 0.005;
+    client_params_t client_params;
+    pthread_mutex_init(&client_params.mutex, NULL);
+    pthread_mutex_lock(&client_params.mutex);
+    client_params.config = config;
+
+    while (wait_for(start_time) < timeout) {
+        printf("wait %f\n", wait_for(start_time));
+        struct sockaddr server_name;
+        socklen_t server_name_len;
+        // client connected
+        printf("Creating a thread\n");
+        int fd = accept(sock, &server_name, &server_name_len);
+        if (fd < 0) {
+            perror("ошибка вызова accept");
+            break;
+        }
+        // creating a thread 
+        pthread_t thread;
+        client_params.fd = fd;
+        int rv = pthread_create(&thread, NULL, rpc_handler, &client_params);
+
+        clock_t start_thread = clock();
+        while (pthread_mutex_trylock(&client_params.mutex) 
+                && wait_for(start_thread) < thread_timeout){}
+        if (pthread_mutex_trylock(&client_params.mutex) && rv == 0){
+            pthread_kill(thread);
+            pthread_mutex_unlock(&client_params.mutex);
+        }
+        
+        pthread_mutex_trylock(&client_params.mutex);
+    }
+}
+
+void *send_rpcs(sock, port){
+    printf("Sending rpcs\n");
+    struct sockaddr_in peer;
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(port);
+    peer.sin_addr.s_addr = inet_addr(IP_ADDR);
+
+    int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
+    if (rc > 0) {
+        perror("ошибка вызова connect");
+        return ((void *)EXIT_FAILURE);        
+    }
+    // if connection is successful print it
+    printf("Connected %d\n", CURRENT_SERVER);
+    response_t response;
+    command_t command = {15};
+    if ((rc = send(sock, &command, sizeof(command), 0)) <= 0) {
+        perror("ошибка вызова send");
+        return ((void *)EXIT_FAILURE);
+    }
+
+    printf("Sent success\n");
+
+    if ((rc = recv(sock, &response, sizeof(response), 0)) <= 0) {
+        perror("ошибка вызова recv");
+        return ((void *)EXIT_FAILURE);
+    }
+    
+    printf("Recieved %d\n", response.val);
+    return ((void *)EXIT_SUCCESS);
+}
+
 int run_server(config_t *config) {
-    printf("Running\n");
+    printf("Running %d\n", config->port);
     struct sockaddr_in local;
     int rc;
-    char buf[1];
     // tuning the server
     local.sin_family = AF_INET;
     local.sin_port = htons(config->port);
     local.sin_addr.s_addr = htonl(INADDR_ANY);
-
+    
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
+    int sock_out = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0 || sock_out < 0) {
         perror ("ошибка вызова socket");
         return (EXIT_FAILURE);
     }
@@ -82,43 +172,65 @@ int run_server(config_t *config) {
     }
 
     // setting the maximum number of clients
-    if (rc = listen(sock, MAX_CLIENTS)) {
+    rc = listen(sock, MAX_CLIENTS);
+    if (rc) {
         perror("ошибка вызова listen");
         return (EXIT_FAILURE);
     }
 
-    client_params_t client_params;
-    pthread_mutex_init(&client_params.mutex, NULL);
-    pthread_mutex_lock(&client_params.mutex);
-    client_params.config = config;
-
-    int i = 0;
-    int n = 5;
+    fflush(stdout);
+    clock_t start = clock();
+    double timeout = 30;
     while (1){
-        struct sockaddr client_name;
-        socklen_t client_name_len;
-        // client connected
-        int fd = accept(sock, &client_name, &client_name_len);
+        if (!leader){
+            // wait for incoming messages from leader/client (it might be hearbeats)
 
-        if (fd < 0) {
-            perror("ошибка вызова accept");
-            break;
         }
-
-        // creating a thread 
-        pthread_t thread;
-        client_params.fd = fd;
-        int rv = pthread_create(&thread, NULL, rpc_handler, &client_params);
-        if (rv == 0){
-            pthread_mutex_lock(&client_params.mutex);
-        }
-        fflush(stdin);
     }
+    while (wait_for(start) < timeout){
+        server_params_t server_params = {
+            .config = config,
+        };
+
+        pthread_mutex_init(&server_params.mutex, NULL);
+        pthread_t receive_thread;
+        int rv = pthread_create(&receive_thread, NULL, receive_rpcs, &server_data);
+        int i = 0;
+        for (i; i < NUMBER_OF_PORTS; i++){
+            if (KNOWN_PORTS[i] != CURRENT_SERVER){
+                send_rpcs(sock_out, KNOWN_PORTS[i]);
+            }
+        }
+    }
+    close(sock);
+}
+
+int parse_str(int *num, char *str){
+    *num = 0;
+
+    int len = strlen(str);
+    int i;
+    for(i = 0; i < len; i++){
+        if (isdigit(str[i])){
+            *num *= 10;
+            *num += str[i] - '0';
+        }
+        else{
+            return BAD_PORT;
+        }
+        if (*num > MAX_PORT){
+            *num = 0;
+            return BAD_PORT;
+        }
+    }
+    return 0;
 }
 
 int main(int argc, char * argv[]){
+    parse_str(&CURRENT_SERVER, argv[1]);
+    
     config_t config = {
-        .port = DEFAULT_PORT
+        .port = CURRENT_SERVER,
     };
     
     int rv = run_server(&config);

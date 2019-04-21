@@ -31,7 +31,8 @@ typedef struct client_params_t {
 } client_params_t;
 
 void * run_client(void * arg){
-    client_params_t client_params = *(client_params_t *)arg;
+    client_params_t *_client_params = arg;
+    client_params_t client_params = *_client_params;
 
     // connecting to server
     struct sockaddr_in peer;
