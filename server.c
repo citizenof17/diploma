@@ -21,6 +21,19 @@
 #define MAX_CLIENTS (5)
 #define NUMBER_OF_PORTS (2)
 #define SELECT_TIMEOUT (3)
+#define HEARTBEAT_TIMEOUT (10.0)
+
+typedef enum whom_e {
+    Unknown,
+    Client,
+    Follower,
+    Candidate,
+    Leader,
+} whom_e;
+
+
+// initially all servers start in follower state
+whom_e State = Follower;
 
 int CURRENT_SERVER = DEFAULT_PORT;
 int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501};
@@ -39,6 +52,11 @@ int *match_index = NULL;
 typedef struct command_t {
     int val;
 } command_t;
+
+typedef struct logg {
+    command_t command;
+    int term;
+} log_t;
 
 typedef struct response_t {
     int val;
@@ -64,6 +82,14 @@ typedef struct server_params_t {
     pthread_mutex_t mutex;
 } server_params_t;
 
+
+
+
+typedef struct message_t {
+    whom_e whom;
+    command_t command;
+} message_t;
+
 void request_vote(int port, response_t *response){
 
 }
@@ -71,12 +97,13 @@ void request_vote(int port, response_t *response){
 void initiate_election(config_t *config){
     printf("Initiate election\n");
     current_term++;
+    State = Candidate;
     voted_for = CURRENT_SERVER;
     //reset election timer? 
 
     int i = 0;
+    int votes = 1;
     for (i; i < NUMBER_OF_PORTS; i++){
-        int votes = 0;
         if (KNOWN_PORTS[i] != CURRENT_SERVER){
             response_t response;
             request_vote(KNOWN_PORTS[i], &response);
@@ -94,68 +121,46 @@ void *rpc_handler(void *arg) {
     client_params_t *_client_params = arg;
     client_params_t client_params = *_client_params;
     pthread_mutex_unlock(&_client_params->mutex);
-    command_t query;
-    response_t response;
+    message_t message;
     
-    int rc = recv(client_params.fd, &query, sizeof(query), 0);
+    int rc = recv(client_params.fd, &message, sizeof(message), 0);
     if (rc <= 0) {
         printf("Failed\n");
         return ((void *)EXIT_FAILURE);
     }
-    else {
-        printf("Received %d\n", query.val);
+
+    printf("Received %d\n", message.command.val);
+
+    // Differentiate between clients and leader/other servers
+    switch (message.whom){
+        case Client:
+            // handle client
+            break;
+        case Follower:
+            // handle follower
+            break;
+        case Candidate:
+            // handle candidate
+            break;
+        case Leader:
+            // handle leader
+            break;
+        default:
+            perror("Unknown peer");
     }
 
+
+    // Return something in response, this should go into switch statement
+    response_t response;
     response.val = 2;
     rc = send(client_params.fd, &response, sizeof(response), 0);
     if (rc <= 0) {
         perror("ошибка вызова send");
-    }  
-}
-
-double wait_for(clock_t start_time){
-    return (clock() - start_time) / CLOCKS_PER_SEC;
-}
-
-void *receive_rpcs(int sock, config_t *config){
-    // In `timeout` try to get incoming calls
-    // for each call create a thread
-    // if thread is not freeing the mutex in `thread_timeout` - kill the thread and unlock the mutex
-    printf("Receiving rpcs\n");
-    clock_t start_time = clock();
-    double timeout = 0.5;
-    double thread_timeout = 0.005;
-    client_params_t client_params;
-    pthread_mutex_init(&client_params.mutex, NULL);
-    pthread_mutex_lock(&client_params.mutex);
-    client_params.config = config;
-
-    while (wait_for(start_time) < timeout) {
-        printf("wait %f\n", wait_for(start_time));
-        struct sockaddr server_name;
-        socklen_t server_name_len;
-        // client connected
-        printf("Creating a thread\n");
-        int fd = accept(sock, &server_name, &server_name_len);
-        if (fd < 0) {
-            perror("ошибка вызова accept");
-            break;
-        }
-        // creating a thread 
-        pthread_t thread;
-        client_params.fd = fd;
-        int rv = pthread_create(&thread, NULL, rpc_handler, &client_params);
-
-        clock_t start_thread = clock();
-        while (pthread_mutex_trylock(&client_params.mutex) 
-                && wait_for(start_thread) < thread_timeout){}
-        if (pthread_mutex_trylock(&client_params.mutex) && rv == 0){
-            pthread_kill(thread);
-            pthread_mutex_unlock(&client_params.mutex);
-        }
-        
-        pthread_mutex_trylock(&client_params.mutex);
     }
+}
+
+double time_spent(clock_t start_time){
+    return (clock() - start_time) / CLOCKS_PER_SEC;
 }
 
 void *send_rpcs(port){
@@ -211,7 +216,6 @@ int run_server(config_t *config) {
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    // int sock_out = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         perror ("ошибка вызова socket");
         return (EXIT_FAILURE);
@@ -231,20 +235,21 @@ int run_server(config_t *config) {
         perror("ошибка вызова listen");
         return (EXIT_FAILURE);
     }
+    struct timeval timeout = {
+        .tv_sec = SELECT_TIMEOUT,
+        .tv_usec = 0,
+    };
 
-    while (1){
-        if (!leader){
-            // wait for incoming messages from leader/client (it might be hearbeats)
+    clock_t last_heartbeat = clock();
+
+    for (;;) {
+        if (State == Follower){
+            // wait for incoming messages from leader/client
             fd_set sockets;
             FD_ZERO(&sockets);
             FD_SET(sock, &sockets);
 
-            struct timeval timeout;
-            timeout.tv_sec = SELECT_TIMEOUT;
-            timeout.tv_usec = 0;
-            printf("Entering select\n");
             int sel = select(sock + 1, &sockets, NULL, NULL, &timeout); 
-            printf("Right after select %d\n", sel);
             if (sel < 0){
                 perror("Ошибка select");
                 return (EXIT_FAILURE);
@@ -257,25 +262,37 @@ int run_server(config_t *config) {
             }
 
             if (FD_ISSET(sock, &sockets)){
-                printf("In FD_ISSET\n");
                 int fd = accept(sock, NULL, NULL);
-                printf("ACCEPTED\n");
+                printf("accepted, got called\n");
+
                 if (fd < 0){
                     perror("Error in accept");
                     return (EXIT_FAILURE);
                 }
 
+                // we do want to have mutex here
                 server_params_t server_params ={
                     .config = config,
                     .fd = fd,
                 };
+                pthread_mutex_lock(&server_params.mutex);
                 pthread_t thread;
                 int rv = pthread_create(&thread, NULL, rpc_handler, &server_params);
                 if (rv == 0){
                     //lock mutex
+                    pthread_mutex_unlock(&server_params.mutex);
                 }
             }
+            
+            // In case we are not receiving heartbeats from leader,
+            // we still want to initiate election 
+            // (this case is possible, if we get the client message)
 
+            // probably, some validation should be added to deal with
+            // running election, when we've been set to follower
+            if (time_spent(last_heartbeat) > HEARTBEAT_TIMEOUT){
+                initiate_election(config);
+            }
         }
         else{
             printf("Leader actions\n");
@@ -288,6 +305,7 @@ int run_server(config_t *config) {
             }
             sleep(5);
         }
+        current_term++;
     }
     //close(sock);
 }
@@ -318,8 +336,9 @@ int main(int argc, char * argv[]){
     config_t config = {
         .port = CURRENT_SERVER,
     };
+
+    state = 
     
-    perror("Hello perror!");
     printf("%d\n", CURRENT_SERVER);
     int rv = run_server(&config);
     if (rv != 0){
