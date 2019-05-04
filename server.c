@@ -20,11 +20,14 @@
 #define IP_ADDR ("127.0.0.1")
 #define MAX_CLIENTS (5)
 #define NUMBER_OF_PORTS (2)
-#define SELECT_TIMEOUT (3)
-#define ELECTION_TIMEOUT (10.0)
-#define CANDIDATE_TIMEOUT (150) // in milliseconds
+#define SELECT_TIMEOUT (3.0)       // in seconds
+#define ELECTION_TIMEOUT (10.0)  // in seconds
+#define CANDIDATE_TIMEOUT (1000) // in milliseconds
 #define min(x, y) (((x) < (y)) ? (x) : (y))
 #define max(x, y) (((x) > (y)) ? (x) : (y))
+
+// rv = retval = return value
+// rc = return code
 
 typedef enum whom_e {
     Unknown,
@@ -61,9 +64,9 @@ int *match_index = NULL;
 
 clock_t last_heartbeat;
 
-struct timeval timeout  = {
+struct timespec timeout  = {
     .tv_sec = SELECT_TIMEOUT,
-    .tv_usec = 0,
+    .tv_nsec = 0,
 };
 
 typedef struct command_t {
@@ -112,7 +115,7 @@ float rand_in_range(float a, float b){
 }
 
 int request_vote(int port, response_t *response){
-    printf("Request vote rpcs %d\n", port);
+    printf("Request vote rpc %d\n", port);
     struct sockaddr_in peer;
     peer.sin_family = AF_INET;
     peer.sin_port = htons(port);
@@ -161,6 +164,7 @@ void initiate_election(config_t *config){
 }
 
 void become_follower(){
+    printf("Become follower\n");
     State = Follower;
     voted_for = NULL;
     votes = 0;
@@ -178,7 +182,9 @@ void *rpc_handler(void *arg, message_t *message) {
         return ((void *)EXIT_FAILURE);
     }
 
-    printf("Received %d\n", message->command.val);
+    printf("Received val %d, term %d, my term: %d\n", message->command.val,
+                                                      message->term,
+                                                      current_term);
     if (message->term > current_term){
         become_follower();
     }
@@ -195,11 +201,15 @@ void *rpc_handler(void *arg, message_t *message) {
         case Candidate:;  // Candidate can send only RequestVote (?)
             // handle candidate
             response_t response = {.val = 0,};
-            if (voted_for == NULL){
+            if (voted_for == NULL){  // we are followers 
                 voted_for = message->from;
                 response.val = 1;
             }
+            printf("Sending data to Candidate, response-val: %d\n", response.val);
             rc = send(client_params.fd, &response, sizeof(response), 0);
+            if (rc <= 0){
+                perror("Ошибка вызова send в rpc_handler");
+            }
             break;
         case Leader:;
             // handle leader
@@ -208,24 +218,16 @@ void *rpc_handler(void *arg, message_t *message) {
             perror("Unknown peer");
     }
 
-
-    // Return something in response, this should go into switch statement
-    response_t response;
-    response.val = 2;
-    rc = send(client_params.fd, &response, sizeof(response), 0);
-    if (rc <= 0) {
-        perror("ошибка вызова send");
-    }
     return ((void *)EXIT_SUCCESS);
 }
 
+// Do not rely on this function when using `sleep`
 double time_spent(clock_t start_time){
-    return (clock() - start_time) / CLOCKS_PER_SEC;
+    return (double)(clock() - start_time) / CLOCKS_PER_SEC;
 }
 
 void *send_append_entry_rpc(int port){
-    printf("Sending rpcs\n");
-    
+    printf("Sending rpcs (fake)\n");
     // TODO: remove this
     return NULL;
 
@@ -274,19 +276,18 @@ typedef struct try_get_rpc_t {
 } try_get_rpc_t;
 
 void *try_get_rpc(void *arg){
-    printf("Try get rps\n");
     try_get_rpc_t *_params = arg;
     try_get_rpc_t params = *_params;
-    // message_t message;
     int sock = params.sock;
-    
+
+    printf("try sock: %d\n", sock);
+
     // wait for incoming messages
     fd_set sockets;
-    FD_ZERO(&sockets);
-    FD_SET(sock, &sockets);
+    FD_ZERO(&sockets);  //clear set
+    FD_SET(sock, &sockets); //add sock to set
 
-    int sel = select(sock + 1, &sockets, NULL, NULL, &timeout); 
-    
+    int sel = pselect(sock + 1, &sockets, NULL, NULL, &timeout, NULL); 
     printf("Select %d\n", sel);
     if (sel < 0){
         perror("Ошибка select");
@@ -295,13 +296,13 @@ void *try_get_rpc(void *arg){
 
     if (params.follower && sel == 0){
         initiate_election(params.config);
-        return NULL;
+        return ((void *)EXIT_SUCCESS);
     }
 
-    if (FD_ISSET(sock, &sockets)){
+    if (FD_ISSET(sock, &sockets)){ 
         int fd = accept(sock, NULL, NULL);
         printf("accepted, got called in try_get_rpc\n");
-
+        fflush(stdout);
         if (fd < 0){
             perror("Error in accept");
             return ((void *)EXIT_FAILURE);
@@ -311,7 +312,6 @@ void *try_get_rpc(void *arg){
             .config = params.config,
             .fd = fd,
         };
-
         message_t message;
         int rc = rpc_handler((void *)&server_params, &message);
 
@@ -320,7 +320,6 @@ void *try_get_rpc(void *arg){
             
         }
         _params->result = 0;
-
         // In case we are not receiving heartbeats from leader,
         // we still want to initiate election 
         // (this case is possible, if we get the client message)
@@ -329,9 +328,50 @@ void *try_get_rpc(void *arg){
         // running election, when we've been set to follower
         if (params.follower && time_spent(last_heartbeat) > ELECTION_TIMEOUT){
             initiate_election(params.config);
-            return NULL;
+            return ((void *)EXIT_SUCCESS);
         }
     }
+}
+
+void *wrap_try_get_rpc(void *arg){
+    printf("wrap try get rpc\n");
+    try_get_rpc_t *_params = arg;
+    try_get_rpc_t params = *_params;
+
+    // struct sockaddr_in local;
+    // int rc;
+    // // tuning the server
+    // local.sin_family = AF_INET;
+    // local.sin_port = htons(CURRENT_SERVER);
+    // local.sin_addr.s_addr = htonl(INADDR_ANY);
+    
+    // int sock = socket(AF_INET, SOCK_STREAM, 0);
+    // if (sock < 0) {
+    //     perror ("ошибка вызова socket");
+    //     return (EXIT_FAILURE);
+    // }
+
+    // // make socket non blocking
+    // fcntl(sock, F_SETFL, O_NONBLOCK);
+
+    // rc = bind(sock, (struct sockaddr *)&local, sizeof(local));
+    // if (rc < 0) {
+    //     perror("ошибка вызова bind");
+    //     return (EXIT_FAILURE);
+    // }
+
+    // // setting maximum number of connections
+    // rc = listen(sock, MAX_CLIENTS);
+    // if (rc) {
+    //     perror("ошибка вызова listen");
+    //     return (EXIT_FAILURE);
+    // }
+
+    // params.sock = sock;
+    // printf("sock: %d   ", sock);
+    try_get_rpc((void *)&params);
+    // close(sock);
+    printf("Leaving wrap_try_get_rpc\n");
 }
 
 void mysleep(int ms){
@@ -343,11 +383,15 @@ void mysleep(int ms){
 
 int run_server(config_t *config) {
     printf("Running %d\n", config->port);
+
+    // try_get_rpc_t *_params = arg;
+    // try_get_rpc_t params = *_params;
+
     struct sockaddr_in local;
     int rc;
     // tuning the server
     local.sin_family = AF_INET;
-    local.sin_port = htons(config->port);
+    local.sin_port = htons(CURRENT_SERVER);
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -359,14 +403,13 @@ int run_server(config_t *config) {
     // make socket non blocking
     fcntl(sock, F_SETFL, O_NONBLOCK);
 
-    printf("Socket %d\n", sock);
     rc = bind(sock, (struct sockaddr *)&local, sizeof(local));
     if (rc < 0) {
         perror("ошибка вызова bind");
         return (EXIT_FAILURE);
     }
 
-    // setting the maximum number of clients (connections)
+    // setting maximum number of connections
     rc = listen(sock, MAX_CLIENTS);
     if (rc) {
         perror("ошибка вызова listen");
@@ -375,8 +418,8 @@ int run_server(config_t *config) {
 
     last_heartbeat = clock();
 
-    for (current_term;;) {
-        printf("Curent term %d\n", current_term);
+    for (current_term;current_term < 15;) {
+        printf("Current term %d\n", current_term);
         try_get_rpc_t params;
         memset(&params, 0, sizeof(params));
         int i = 0;
@@ -384,24 +427,26 @@ int run_server(config_t *config) {
             case Follower:;
                 printf("I'm Follower\n");
                 become_follower();
+                params.sock = sock;
                 params.follower = 1;
-                try_get_rpc((void *)&params);
+                wrap_try_get_rpc((void *)&params);
                 break;
             case Candidate:;
-                printf("I'm Candidate\n");
-                mysleep((int)rand_in_range(0.0, CANDIDATE_TIMEOUT));
-                // create thread to get possible append_entries rps 
+                // create thread to get possible append_entries rpc 
                 pthread_t thread;
                 params.sock = sock;
                 params.config = config;
                 params.follower = 0;
-                int rv = pthread_create(&thread, NULL, try_get_rpc, &params);
-                
-                // election, trying to get votes, in case we got rpc in thread ^,
-                // stop requesting
+                int rv = pthread_create(&thread, NULL, wrap_try_get_rpc, &params);
+                int sleep_time = (int)rand_in_range(0.0, CANDIDATE_TIMEOUT);
+                printf("I'm Candidate, sleeping %d\n", sleep_time);
+                mysleep(sleep_time);
+
+                // election, trying to get votes.
+                // in case we got rpc in try_get_rpc thread stop requesting
                 for (i = 0; i < NUMBER_OF_PORTS && State == Candidate; i++){
                     if (KNOWN_PORTS[i] != CURRENT_SERVER){
-                        response_t response;
+                        response_t response = {.val = 0,};
                         if ((request_vote(KNOWN_PORTS[i], &response)) != EXIT_SUCCESS){
                             //retry
                         }
@@ -412,11 +457,15 @@ int run_server(config_t *config) {
                 // first outcome in perfect situation 
                 // (no other server is claimed as leader)
                 if (votes > NUMBER_OF_PORTS / 2 && State == Candidate){
+                    printf("Become Leader, votes = %d", votes);
                     State = Leader;
                     //send_heartbeat();
                 }
+                pthread_join(thread, NULL);
+                printf("wrap is closed\n");
                 break;
             case Leader:;
+                printf("I'm Leader\n");
                 // leader actions
                 for (i = 0; i < NUMBER_OF_PORTS; i++){
                     if (KNOWN_PORTS[i] != CURRENT_SERVER){
@@ -432,7 +481,7 @@ int run_server(config_t *config) {
         }
         current_term++;
     }
-    //close(sock);
+    close(sock);
 }
 
 int parse_str(int *num, char *str){
@@ -457,12 +506,12 @@ int parse_str(int *num, char *str){
 }
 
 int main(int argc, char * argv[]){
+    srand(time(NULL));
     parse_str(&CURRENT_SERVER, argv[1]);
     config_t config = {
         .port = CURRENT_SERVER,
     };
     
-    printf("%d\n", CURRENT_SERVER);
     int rc = run_server(&config);
     if (rc != 0){
         printf("Fail?\n");
