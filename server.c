@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -114,6 +116,29 @@ float rand_in_range(float a, float b){
     return a + (float)(rand())/(float)(RAND_MAX) * (b - a);
 }
 
+int safe_leave(int sock, pthread_mutex_t *mutex){
+    printf("close sock: %d\n", sock);
+    // int rc = close(sock);
+    int rc = shutdown(sock, SHUT_RDWR);
+    if (rc == -1){
+        perror("ERROR IN CLOSE");
+    }
+    rc = close(sock);
+    if (rc == -1){
+        perror("ERROR IN CLOSE");
+    }
+    if (mutex != NULL){
+        rc = pthread_mutex_unlock(mutex);
+        if (rc != 0){
+            perror("Error in unlock");
+            return (EXIT_FAILURE);
+        }
+        printf("Leaving wrap_try_get_rpc -------------------^\n");
+    }
+    fflush(stdout);
+    return (EXIT_SUCCESS);
+}
+
 int request_vote(int port, response_t *response){
     printf("Request vote rpc %d\n", port);
     struct sockaddr_in peer;
@@ -124,12 +149,15 @@ int request_vote(int port, response_t *response){
     int sock;
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("ошибка вызова socket");
+        safe_leave(sock, NULL);
         return (EXIT_FAILURE);
     }
+    printf("Open socket in request_vote: %d\n", sock);
 
     int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
     if (rc != 0) {
         perror("ошибка вызова connect");
+        safe_leave(sock, NULL);
         return (EXIT_FAILURE);        
     }
     printf("Connected %d %d\n", CURRENT_SERVER, port);
@@ -141,15 +169,17 @@ int request_vote(int port, response_t *response){
     };
     if ((rc = send(sock, &message, sizeof(message), 0)) <= 0) {
         perror("ошибка вызова send");
+        safe_leave(sock, NULL);
         return (EXIT_FAILURE);
     }
     printf("Sent success\n");
     if ((rc = recv(sock, response, sizeof(*response), 0)) <= 0) {
         perror("ошибка вызова recv");
+        safe_leave(sock, NULL);        
         return (EXIT_FAILURE);
     }
     
-    close(sock);
+    safe_leave(sock, NULL);
     printf("Recieved %d\n", response->val);
     return (EXIT_SUCCESS);
 }
@@ -168,14 +198,14 @@ void become_follower(){
     State = Follower;
     voted_for = NULL;
     votes = 0;
-    last_heartbeat = clock();
 }
 
-void *rpc_handler(void *arg, message_t *message) {
-    client_params_t *_client_params = arg;
+void *rpc_handler(client_params_t *_client_params, message_t *message) {
+    // client_params_t *_client_params = arg;
     client_params_t client_params = *_client_params;
-    pthread_mutex_unlock(&_client_params->mutex);
+    // pthread_mutex_unlock(&_client_params->mutex);
     
+    printf("fd: %d\n", client_params.fd);
     int rc = recv(client_params.fd, message, sizeof(*message), 0);
     if (rc <= 0) {
         printf("Failed\n");
@@ -205,11 +235,11 @@ void *rpc_handler(void *arg, message_t *message) {
                 voted_for = message->from;
                 response.val = 1;
             }
-            printf("Sending data to Candidate, response-val: %d\n", response.val);
             rc = send(client_params.fd, &response, sizeof(response), 0);
             if (rc <= 0){
                 perror("Ошибка вызова send в rpc_handler");
             }
+            printf("Sending data to Candidate, response-val: %d\n", response.val);
             break;
         case Leader:;
             // handle leader
@@ -229,42 +259,42 @@ double time_spent(clock_t start_time){
 void *send_append_entry_rpc(int port){
     printf("Sending rpcs (fake)\n");
     // TODO: remove this
-    return NULL;
+    // return NULL;
 
-    struct sockaddr_in peer;
-    peer.sin_family = AF_INET;
-    peer.sin_port = htons(port);
-    peer.sin_addr.s_addr = inet_addr(IP_ADDR);
+    // struct sockaddr_in peer;
+    // peer.sin_family = AF_INET;
+    // peer.sin_port = htons(port);
+    // peer.sin_addr.s_addr = inet_addr(IP_ADDR);
 
-    int sock;
+    // int sock;
+    // printf("open sock: %d\n", sock);
+    // if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    //     perror("ошибка вызова socket");
+    //     return ((void *)EXIT_FAILURE);
+    // }
 
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("ошибка вызова socket");
-        return ((void *)EXIT_FAILURE);
-    }
+    // int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
+    // if (rc > 0) {
+    //     perror("ошибка вызова connect");
+    //     return ((void *)EXIT_FAILURE);        
+    // }
+    // // if connection is successful print it
+    // printf("Connected %d\n", CURRENT_SERVER);
+    // response_t response;
+    // command_t command = {15};
+    // if ((rc = send(sock, &command, sizeof(command), 0)) <= 0) {
+    //     perror("ошибка вызова send");
+    //     return ((void *)EXIT_FAILURE);
+    // }
+    // printf("Sent success\n");
+    // if ((rc = recv(sock, &response, sizeof(response), 0)) <= 0) {
+    //     perror("ошибка вызова recv");
+    //     return ((void *)EXIT_FAILURE);
+    // }
 
-    int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
-    if (rc > 0) {
-        perror("ошибка вызова connect");
-        return ((void *)EXIT_FAILURE);        
-    }
-    // if connection is successful print it
-    printf("Connected %d\n", CURRENT_SERVER);
-    response_t response;
-    command_t command = {15};
-    if ((rc = send(sock, &command, sizeof(command), 0)) <= 0) {
-        perror("ошибка вызова send");
-        return ((void *)EXIT_FAILURE);
-    }
-    printf("Sent success\n");
-    if ((rc = recv(sock, &response, sizeof(response), 0)) <= 0) {
-        perror("ошибка вызова recv");
-        return ((void *)EXIT_FAILURE);
-    }
-    
-    close(sock);
-    printf("Recieved %d\n", response.val);
-    return ((void *)EXIT_SUCCESS);
+    // close(sock);
+    // printf("Recieved %d\n", response.val);
+    // return ((void *)EXIT_SUCCESS);
 }
 
 
@@ -273,14 +303,13 @@ typedef struct try_get_rpc_t {
     int result;
     int follower;
     config_t * config;
+    pthread_mutex_t mutex;
 } try_get_rpc_t;
 
 void *try_get_rpc(void *arg){
     try_get_rpc_t *_params = arg;
     try_get_rpc_t params = *_params;
     int sock = params.sock;
-
-    printf("try sock: %d\n", sock);
 
     // wait for incoming messages
     fd_set sockets;
@@ -300,25 +329,25 @@ void *try_get_rpc(void *arg){
     }
 
     if (FD_ISSET(sock, &sockets)){ 
+        // struct sockaddr_in client_name;
+        // socklen_t client_name_len;
+        // int fd = accept(sock, &client_name, &client_name_len);
         int fd = accept(sock, NULL, NULL);
         printf("accepted, got called in try_get_rpc\n");
-        fflush(stdout);
-        if (fd < 0){
+        if (fd <= 0){
             perror("Error in accept");
             return ((void *)EXIT_FAILURE);
         }
 
-        server_params_t server_params = {
+        client_params_t client_params = {
             .config = params.config,
             .fd = fd,
         };
         message_t message;
-        int rc = rpc_handler((void *)&server_params, &message);
+        int rc = rpc_handler(&client_params, &message);
 
         //interpret message result
-        if (message.term > current_term){
-            
-        }
+        if (message.term > current_term){}
         _params->result = 0;
         // In case we are not receiving heartbeats from leader,
         // we still want to initiate election 
@@ -328,50 +357,63 @@ void *try_get_rpc(void *arg){
         // running election, when we've been set to follower
         if (params.follower && time_spent(last_heartbeat) > ELECTION_TIMEOUT){
             initiate_election(params.config);
-            return ((void *)EXIT_SUCCESS);
         }
     }
+    return ((void *)EXIT_SUCCESS);
 }
 
+
 void *wrap_try_get_rpc(void *arg){
-    printf("wrap try get rpc\n");
+    printf("wrap try get rpc -------------------v\n");
     try_get_rpc_t *_params = arg;
     try_get_rpc_t params = *_params;
-
-    // struct sockaddr_in local;
-    // int rc;
-    // // tuning the server
-    // local.sin_family = AF_INET;
-    // local.sin_port = htons(CURRENT_SERVER);
-    // local.sin_addr.s_addr = htonl(INADDR_ANY);
+    int rc;
+    rc = pthread_mutex_lock(&_params->mutex);
+    if (rc != 0){
+        perror("Error in lock");
+        return ((void *)EXIT_FAILURE);
+    }
+    struct sockaddr_in local;
+    // tuning the server
+    memset(&local, 0, sizeof(struct sockaddr_in));
+    local.sin_family = AF_INET;
+    local.sin_port = htons(CURRENT_SERVER);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
     
-    // int sock = socket(AF_INET, SOCK_STREAM, 0);
-    // if (sock < 0) {
-    //     perror ("ошибка вызова socket");
-    //     return (EXIT_FAILURE);
-    // }
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    printf("open sock in wrap: %d\n", sock);
 
-    // // make socket non blocking
-    // fcntl(sock, F_SETFL, O_NONBLOCK);
+    if (sock < 0) {
+        perror ("ошибка вызова socket");
+        return ((void *)EXIT_FAILURE);
+    }
 
-    // rc = bind(sock, (struct sockaddr *)&local, sizeof(local));
-    // if (rc < 0) {
-    //     perror("ошибка вызова bind");
-    //     return (EXIT_FAILURE);
-    // }
+    // make socket non blocking
+    rc = fcntl(sock, F_SETFL, O_NONBLOCK);
+    if (rc < 0){
+        perror("Error in fcntl");
+        safe_leave(sock, &_params->mutex);
+        return ((void *)EXIT_FAILURE);
+    }
+    rc = bind(sock, (struct sockaddr *)&local, sizeof(local));
+    if (rc < 0) {
+        perror("ошибка вызова bind in wrap!");
+        safe_leave(sock, &_params->mutex);
+        return ((void *)EXIT_FAILURE);
+    }
 
-    // // setting maximum number of connections
-    // rc = listen(sock, MAX_CLIENTS);
-    // if (rc) {
-    //     perror("ошибка вызова listen");
-    //     return (EXIT_FAILURE);
-    // }
+    // setting maximum number of connections
+    rc = listen(sock, MAX_CLIENTS);
+    if (rc) {
+        perror("ошибка вызова listen");
+        safe_leave(sock, &_params->mutex);
+        return ((void *)EXIT_FAILURE);
+    }
 
-    // params.sock = sock;
-    // printf("sock: %d   ", sock);
-    try_get_rpc((void *)&params);
-    // close(sock);
-    printf("Leaving wrap_try_get_rpc\n");
+    params.sock = sock;
+    try_get_rpc(&params);
+    safe_leave(sock, &_params->mutex);
+    return ((void *)EXIT_SUCCESS);
 }
 
 void mysleep(int ms){
@@ -384,60 +426,28 @@ void mysleep(int ms){
 int run_server(config_t *config) {
     printf("Running %d\n", config->port);
 
-    // try_get_rpc_t *_params = arg;
-    // try_get_rpc_t params = *_params;
-
-    struct sockaddr_in local;
-    int rc;
-    // tuning the server
-    local.sin_family = AF_INET;
-    local.sin_port = htons(CURRENT_SERVER);
-    local.sin_addr.s_addr = htonl(INADDR_ANY);
-    
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror ("ошибка вызова socket");
-        return (EXIT_FAILURE);
-    }
-
-    // make socket non blocking
-    fcntl(sock, F_SETFL, O_NONBLOCK);
-
-    rc = bind(sock, (struct sockaddr *)&local, sizeof(local));
-    if (rc < 0) {
-        perror("ошибка вызова bind");
-        return (EXIT_FAILURE);
-    }
-
-    // setting maximum number of connections
-    rc = listen(sock, MAX_CLIENTS);
-    if (rc) {
-        perror("ошибка вызова listen");
-        return (EXIT_FAILURE);
-    }
-
     last_heartbeat = clock();
+    try_get_rpc_t params;
+    memset(&params, 0, sizeof(params));
+    pthread_mutex_init(&params.mutex, NULL);
 
-    for (current_term;current_term < 15;) {
+    for (current_term;current_term < 5;) {
         printf("Current term %d\n", current_term);
-        try_get_rpc_t params;
-        memset(&params, 0, sizeof(params));
         int i = 0;
+        pthread_t thread;
+
         switch (State){
             case Follower:;
                 printf("I'm Follower\n");
                 become_follower();
-                params.sock = sock;
                 params.follower = 1;
-                wrap_try_get_rpc((void *)&params);
+                wrap_try_get_rpc(&params);
                 break;
             case Candidate:;
                 // create thread to get possible append_entries rpc 
-                pthread_t thread;
-                params.sock = sock;
                 params.config = config;
                 params.follower = 0;
-                int rv = pthread_create(&thread, NULL, wrap_try_get_rpc, &params);
+                pthread_create(&thread, NULL, wrap_try_get_rpc, &params);
                 int sleep_time = (int)rand_in_range(0.0, CANDIDATE_TIMEOUT);
                 printf("I'm Candidate, sleeping %d\n", sleep_time);
                 mysleep(sleep_time);
@@ -446,10 +456,11 @@ int run_server(config_t *config) {
                 // in case we got rpc in try_get_rpc thread stop requesting
                 for (i = 0; i < NUMBER_OF_PORTS && State == Candidate; i++){
                     if (KNOWN_PORTS[i] != CURRENT_SERVER){
-                        response_t response = {.val = 0,};
-                        if ((request_vote(KNOWN_PORTS[i], &response)) != EXIT_SUCCESS){
+                        response_t response = {.val = 0};
+                        request_vote(KNOWN_PORTS[i], &response);
+                        // if ((request_vote(KNOWN_PORTS[i], &response)) != EXIT_SUCCESS){
                             //retry
-                        }
+                        // }
                         votes += response.val;
                     }
                 }
@@ -457,11 +468,14 @@ int run_server(config_t *config) {
                 // first outcome in perfect situation 
                 // (no other server is claimed as leader)
                 if (votes > NUMBER_OF_PORTS / 2 && State == Candidate){
-                    printf("Become Leader, votes = %d", votes);
+                    printf("Become Leader, votes = %d\n", votes);
                     State = Leader;
                     //send_heartbeat();
                 }
-                pthread_join(thread, NULL);
+                int rc = pthread_kill(thread, NULL);
+                if (rc != 0){
+                    perror("Error in pthread_kill");
+                }
                 printf("wrap is closed\n");
                 break;
             case Leader:;
@@ -479,9 +493,10 @@ int run_server(config_t *config) {
                 printf("Unknown state %d", State);
                 break;
         }
+        fflush(stdout);
         current_term++;
     }
-    close(sock);
+    // close(sock);s
 }
 
 int parse_str(int *num, char *str){

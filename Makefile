@@ -24,17 +24,17 @@
 # 	${RM} *.o
 #
 
-all: server client test clear
+all: server clear
 
 server: server.o
-	gcc -o server server.o -pthread
-client: client.o
-	gcc -o client client.o -pthread
+	gcc -g -o server server.o -lpthread
+# client: client.o
+	# gcc -o client client.o -lpthread
 test: test.o
-	gcc -o test test.o -pthread
+	gcc -o test test.o -lpthread
 
 server.o: server.c
-client.o: client.c
+# client.o: client.c
 test.o: test.c
 
 clear:
