@@ -22,9 +22,9 @@
 #define IP_ADDR ("127.0.0.1")
 #define MAX_CLIENTS (5)
 #define NUMBER_OF_PORTS (2)
-#define SELECT_TIMEOUT (3.0)       // in seconds
+#define SELECT_TIMEOUT (10.0)       // in seconds
 #define ELECTION_TIMEOUT (10.0)  // in seconds
-#define CANDIDATE_TIMEOUT (1000) // in milliseconds
+#define CANDIDATE_TIMEOUT (5000) // in milliseconds
 #define min(x, y) (((x) < (y)) ? (x) : (y))
 #define max(x, y) (((x) > (y)) ? (x) : (y))
 
@@ -117,12 +117,7 @@ float rand_in_range(float a, float b){
 }
 
 int safe_leave(int sock, pthread_mutex_t *mutex){
-    printf("close sock: %d\n", sock);
-    // int rc = close(sock);
-    int rc = shutdown(sock, SHUT_RDWR);
-    if (rc == -1){
-        perror("ERROR IN CLOSE");
-    }
+    int rc;
     rc = close(sock);
     if (rc == -1){
         perror("ERROR IN CLOSE");
@@ -206,7 +201,8 @@ void *rpc_handler(client_params_t *_client_params, message_t *message) {
     // pthread_mutex_unlock(&_client_params->mutex);
     
     printf("fd: %d\n", client_params.fd);
-    int rc = recv(client_params.fd, message, sizeof(*message), 0);
+    int rc;
+    rc = recv(client_params.fd, message, sizeof(*message), 0);
     if (rc <= 0) {
         printf("Failed\n");
         return ((void *)EXIT_FAILURE);
@@ -219,7 +215,7 @@ void *rpc_handler(client_params_t *_client_params, message_t *message) {
         become_follower();
     }
     current_term = max(message->term, current_term);
-
+    response_t response = {.val = 0,};
     // Differentiate between clients and leader/other servers
     switch (message->whom){
         case Client:;
@@ -230,7 +226,6 @@ void *rpc_handler(client_params_t *_client_params, message_t *message) {
             break;
         case Candidate:;  // Candidate can send only RequestVote (?)
             // handle candidate
-            response_t response = {.val = 0,};
             if (voted_for == NULL){  // we are followers 
                 voted_for = message->from;
                 response.val = 1;
@@ -243,6 +238,11 @@ void *rpc_handler(client_params_t *_client_params, message_t *message) {
             break;
         case Leader:;
             // handle leader
+            rc = send(client_params.fd, &response, sizeof(response), 0);
+            if (rc <= 0){
+                perror("Ошибка вызова send в rpc_handler");
+            }
+            printf("Sending data to Leader\n");
             break;
         default:;
             perror("Unknown peer");
@@ -257,44 +257,51 @@ double time_spent(clock_t start_time){
 }
 
 void *send_append_entry_rpc(int port){
-    printf("Sending rpcs (fake)\n");
-    // TODO: remove this
-    // return NULL;
+    printf("Send rpc\n");
 
-    // struct sockaddr_in peer;
-    // peer.sin_family = AF_INET;
-    // peer.sin_port = htons(port);
-    // peer.sin_addr.s_addr = inet_addr(IP_ADDR);
+    struct sockaddr_in peer;
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(port);
+    peer.sin_addr.s_addr = inet_addr(IP_ADDR);
 
-    // int sock;
-    // printf("open sock: %d\n", sock);
-    // if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-    //     perror("ошибка вызова socket");
-    //     return ((void *)EXIT_FAILURE);
-    // }
+    int sock;
+    int rc;
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("ошибка вызова socket");
+        return ((void *)EXIT_FAILURE);
+    }
 
-    // int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
-    // if (rc > 0) {
-    //     perror("ошибка вызова connect");
-    //     return ((void *)EXIT_FAILURE);        
-    // }
-    // // if connection is successful print it
-    // printf("Connected %d\n", CURRENT_SERVER);
-    // response_t response;
+    rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
+    if (rc > 0) {
+        perror("ошибка вызова connect");
+        safe_leave(sock, NULL);
+        return ((void *)EXIT_FAILURE);        
+    }
+    // if connection is successful print it
+    printf("Connected %d\n", CURRENT_SERVER);
+    response_t response;
+    // There will go logic for replicating log
+    // Right now send hearbeats only
+    message_t message = {
+        .type = HeartBeat,
+        .whom = Leader,
+        .term = current_term,
+        .from = CURRENT_SERVER,        
+    };
     // command_t command = {15};
-    // if ((rc = send(sock, &command, sizeof(command), 0)) <= 0) {
-    //     perror("ошибка вызова send");
-    //     return ((void *)EXIT_FAILURE);
-    // }
-    // printf("Sent success\n");
-    // if ((rc = recv(sock, &response, sizeof(response), 0)) <= 0) {
-    //     perror("ошибка вызова recv");
-    //     return ((void *)EXIT_FAILURE);
-    // }
+    if ((rc = send(sock, &message, sizeof(message), 0)) <= 0) {
+        perror("ошибка вызова send");
+        return ((void *)EXIT_FAILURE);
+    }
+    printf("Send success\n");
+    if ((rc = recv(sock, &response, sizeof(response), 0)) <= 0) {
+        perror("ошибка вызова recv");
+        return ((void *)EXIT_FAILURE);
+    }
 
-    // close(sock);
-    // printf("Recieved %d\n", response.val);
-    // return ((void *)EXIT_SUCCESS);
+    close(sock);
+    printf("Recieved %d\n", response.val);
+    return ((void *)EXIT_SUCCESS);
 }
 
 
@@ -316,6 +323,7 @@ void *try_get_rpc(void *arg){
     FD_ZERO(&sockets);  //clear set
     FD_SET(sock, &sockets); //add sock to set
 
+    // using pselect instead of select because select may decrease the timeout
     int sel = pselect(sock + 1, &sockets, NULL, NULL, &timeout, NULL); 
     printf("Select %d\n", sel);
     if (sel < 0){
@@ -358,6 +366,7 @@ void *try_get_rpc(void *arg){
         if (params.follower && time_spent(last_heartbeat) > ELECTION_TIMEOUT){
             initiate_election(params.config);
         }
+        close(fd);
     }
     return ((void *)EXIT_SUCCESS);
 }
@@ -381,10 +390,16 @@ void *wrap_try_get_rpc(void *arg){
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    printf("open sock in wrap: %d\n", sock);
-
     if (sock < 0) {
         perror ("ошибка вызова socket");
+        return ((void *)EXIT_FAILURE);
+    }
+
+    int enable = 1;
+    //https://hea-www.harvard.edu/~fine/Tech/addrinuse.html
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0){
+        perror("setsockopt(SO_REUSEADDR) failed");
+        safe_leave(sock, &_params->mutex);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -431,9 +446,10 @@ int run_server(config_t *config) {
     memset(&params, 0, sizeof(params));
     pthread_mutex_init(&params.mutex, NULL);
 
-    for (current_term;current_term < 5;) {
+    for (current_term;current_term < 10;) {
         printf("Current term %d\n", current_term);
         int i = 0;
+        int rc;
         pthread_t thread;
 
         switch (State){
@@ -472,11 +488,10 @@ int run_server(config_t *config) {
                     State = Leader;
                     //send_heartbeat();
                 }
-                int rc = pthread_kill(thread, NULL);
+                rc = pthread_kill(thread, NULL);
                 if (rc != 0){
                     perror("Error in pthread_kill");
                 }
-                printf("wrap is closed\n");
                 break;
             case Leader:;
                 printf("I'm Leader\n");
@@ -496,7 +511,7 @@ int run_server(config_t *config) {
         fflush(stdout);
         current_term++;
     }
-    // close(sock);s
+    // close(sock);
 }
 
 int parse_str(int *num, char *str){
