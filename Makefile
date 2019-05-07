@@ -24,10 +24,12 @@
 # 	${RM} *.o
 #
 
+STD=-std=c11
+
 all: server clear
 
 server: server.o
-	gcc -g -o server server.o -lpthread
+	gcc ${STD} -g -o server server.o -lpthread
 # client: client.o
 	# gcc -o client client.o -lpthread
 test: test.o
