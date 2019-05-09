@@ -22,7 +22,7 @@
 #define MAX_PORT (65535)
 #define IP_ADDR ("127.0.0.1")
 #define MAX_CLIENTS (5)
-#define NUMBER_OF_PORTS (3)
+#define NUMBER_OF_PORTS (2)
 #define SELECT_TIMEOUT (5.0)    // in seconds
 #define ELECTION_TIMEOUT (10.0)  // in seconds
 #define CANDIDATE_TIMEOUT (5000) // in milliseconds
@@ -76,30 +76,17 @@ typedef struct prepare_message_t {
     int from;
 } prepare_message_t;
 
-typedef struct log_t {
+typedef struct entry_t {
     int term;
     int index;
     command_t command;
-} log_t;
+} entry_t;
 
 typedef struct log_arr_t {
     int size;
     int last; // position to write, inclusive, starting from 1
-    log_t *entries;
+    entry_t *entries;
 } log_arr_t;
-
-void update_log_size(log_arr_t *logg){
-    logg->entries = 
-        (log_t *)realloc(logg->entries, 2 * logg->size * sizeof(log_t));
-    logg->size *= 2;
-}
-
-void push_back(log_arr_t *logg, log_t entry){
-    if (logg->last == logg->size){
-        update_log_size(logg);
-    }
-    logg->entries[logg->last++] = entry;
-}
 
 typedef struct response_t {
     int val;
@@ -112,13 +99,25 @@ typedef struct ae_rpc_message_t {
     int prev_log_index;
     int prev_log_term;
     int leader_commit;
-    log_t entries;
+    entry_t entries;
 } ae_rpc_message_t;
 
 typedef struct ae_rpc_response_t {
     int term;
     int success;
 } ae_rpc_response_t;
+
+typedef struct rv_rpc_message_t {
+    int term;
+    int candidate_id;
+    int last_log_index;
+    int last_log_term;
+} rv_rpc_message_t;
+
+typedef struct rv_rpc_response_t {
+    int term;
+    int vote_granted;
+} rv_rpc_response_t;
 
 typedef struct status_t {
     int val;
@@ -156,10 +155,12 @@ whom_e State = Follower;
 
 // int SERVER_ID = SERVER_ID;
 int SERVER_ID;
-int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501, 7502};
+int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501};
 int leader = 0;
 
-int last_log_index = 0; // actually, this sohuld be equal to log_arr.lasts - 1
+int last_log_index = 0; // this sohuld be equal to log_arr.last - 1
+                        // index of last written log entry
+int last_log_term = 0;  // term of last entry in log
 
 int current_term = 0;
 int voted_for = 0;
@@ -174,6 +175,63 @@ int match_index[NUMBER_OF_PORTS] = {0, 0, 0};
 
 clock_t last_heartbeat;
 
+command_t gen_command(){
+    command_t command = {
+        .val = rand(),
+    };
+    return command;
+}
+
+entry_t make_entry(command_t command, int term, int index){
+    entry_t entry = {
+        .term = term,
+        .index = index,
+        .command = command,
+    };
+    return entry;
+}
+
+void increase_log_size(log_arr_t *logg){
+    logg->entries = 
+        (entry_t *)realloc(logg->entries, 2 * logg->size * sizeof(entry_t));
+    logg->size *= 2;
+}
+
+void push_back(log_arr_t *logg, entry_t entry){
+    if (logg->last == logg->size){
+        increase_log_size(logg);
+    }
+    logg->entries[logg->last++] = entry;
+    last_log_index = entry.index;
+    last_log_term = entry.term;
+}
+
+void print_command(command_t command){
+    printf("Val: %d\n", command.val);
+}
+
+void print_entry(entry_t entry){
+    printf("Term %d, Index %d ", entry.term, entry.index);
+    print_command(entry.command);
+}
+
+void print_log(log_arr_t logg){
+    int i;
+    printf("===================\n");
+    printf("|| Printing log   ||\n");
+    printf("===================\n");
+    printf("Log size: %d, log last %d\n", logg.size, logg.last);
+    printf("\n");
+    for (i = 0; i <= logg.last; i++){
+        printf("Index %d: \n", i);
+        print_entry(logg.entries[i]);
+    }
+
+    printf("===================\n");
+    printf("|| Log is printed ||\n");
+    printf("===================\n");
+}
+
 float rand_in_range(float a, float b){
     return a + (float)(rand())/(float)(RAND_MAX) * (b - a);
 }
@@ -187,11 +245,16 @@ void timestamp(){
     printf("Timestamp: %d\n",(int)time(NULL));
 }
 
+// Do not rely on this function when using `sleep`
+double time_spent(clock_t start_time){
+    return (double)(clock() - start_time) / CLOCKS_PER_SEC;
+}
+
 int eq_command(const command_t a, const command_t b){
     return a.val == b.val;
 }
 
-int eq_entries(const log_t a, const log_t b){
+int eq_entries(const entry_t a, const entry_t b){
     return eq_command(a.command, b.command) && 
         a.index == b.index &&
         a.term == b.index;
@@ -220,6 +283,17 @@ void become_follower(){
     State = Follower;
     voted_for = 0;
     votes = 0;
+}
+
+void become_leader(){
+    printf("Become Leader, votes = %d\n", votes);
+    State = Leader;
+    int i;
+    for (i = 0; i < NUMBER_OF_PORTS; i++){
+        if (i != SERVER_ID){
+            next_index[i] = log_arr.last;
+        }
+    }
 }
 
 void initiate_election(config_t *config){
@@ -254,7 +328,7 @@ int send_prep_message(int sock, type_e type, whom_e whom, int from){
     return (EXIT_SUCCESS);
 }
 
-int request_vote(int port, response_t *response){
+int request_vote(int port){
     printf("Request vote rpc %d\n", port);
     struct sockaddr_in peer;
     peer.sin_family = AF_INET;
@@ -276,40 +350,101 @@ int request_vote(int port, response_t *response){
         return (EXIT_FAILURE);        
     }
     printf("Connected %d %d\n", SERVER_ID, port);
-    message_t message = {
-        .whom = Candidate,
+    rc = send_prep_message(sock, RequestVote, Candidate, SERVER_ID);
+    if (rc != EXIT_SUCCESS){
+        perror("Error in prep message in request vote");
+        safe_leave(sock, NULL);
+        return (EXIT_FAILURE);
+    }
+
+    rv_rpc_message_t message = {
         .term = current_term,
-        .type = RequestVote,
         .candidate_id = SERVER_ID,
+        .last_log_index = last_log_index,
+        .last_log_term = last_log_term,
     };
-    if ((rc = send(sock, &message, sizeof(message), 0)) <= 0) {
+
+    rc = send(sock, &message, sizeof(message), 0);
+    if (rc <= 0) {
         perror("ошибка вызова send");
         safe_leave(sock, NULL);
         return (EXIT_FAILURE);
     }
-    printf("Sent success\n");
-    if ((rc = recv(sock, response, sizeof(*response), 0)) <= 0) {
+
+    rv_rpc_response_t response;
+    rc = recv(sock, &response, sizeof(response), 0);
+    if (rc <= 0) {
         perror("ошибка вызова recv");
         safe_leave(sock, NULL);        
         return (EXIT_FAILURE);
     }
 
-    if (response->term > current_term){
-        current_term = response->term;
+    if (response.term > current_term){
+        current_term = response.term;
         become_follower();
     }
-    
+
+    votes += response.vote_granted;
     safe_leave(sock, NULL);
-    printf("Recieved %d\n", response->val);
+    printf("Recieved %d\n", response.vote_granted);
     return (EXIT_SUCCESS);
 }
 
-void *handle_append_entry_rpc(int sock){
+void *handle_request_vote_rpc(int sock){
     int rc;
     int ready = 1;
     rc = send(sock, &ready, sizeof(ready), 0);
     if (rc <= 0){
-        perror("Ошибка вызова send в rpc_handler");
+        perror("Ошибка вызова send в handle_request_vote_rpc");
+        safe_leave(sock, NULL);
+        return ((void *)EXIT_FAILURE);
+    }
+
+    rv_rpc_message_t message;
+    rc = recv(sock, &message, sizeof(message), 0);
+    if (rc <= 0) {
+        perror("Error in handle_request_vote_rpc recv");
+        safe_leave(sock, NULL);
+        return ((void *)EXIT_FAILURE);
+    }
+
+    rv_rpc_response_t response = {
+        .term = current_term,
+        .vote_granted = 0,
+    };
+
+    if (message.term < current_term){
+        //1. Reply false if term < currentTerm (§5.1)
+    }
+    else {
+        // 2. If votedFor is null or candidateId, and candidate’s log is at
+        // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+        if ((!voted_for || voted_for == message.candidate_id) && 
+        message.last_log_index >= last_log_index && 
+        message.last_log_term >= last_log_term){
+            response.vote_granted = 1;
+        }
+    }
+
+    rc = send(sock, &response, sizeof(response), 0);
+    printf("Sending data to Candidate vote_granted: %d\n",response.vote_granted);
+    if (rc <= 0){
+        perror("Error in handle_request_vote_rpc send");
+        safe_leave(sock, NULL);
+        return ((void *)EXIT_FAILURE);
+    }
+
+    return ((void *) EXIT_SUCCESS);
+}
+
+void *handle_append_entries_rpc(int sock){
+    printf("Handling append entry rpc");
+
+    int rc;
+    int ready = 1;
+    rc = send(sock, &ready, sizeof(ready), 0);
+    if (rc <= 0){
+        perror("Ошибка вызова send в handle_append_entries_rpc");
         safe_leave(sock, NULL);
         return ((void *)EXIT_FAILURE);
     }
@@ -317,7 +452,7 @@ void *handle_append_entry_rpc(int sock){
     ae_rpc_message_t message;
     rc = recv(sock, &message, sizeof(message), 0);
     if (rc <= 0) {
-        perror("Error in handle_append_entry_rpc recv");
+        perror("Error in handle_append_entries_rpc recv");
         safe_leave(sock, NULL);
         return ((void *)EXIT_FAILURE);
     }
@@ -326,6 +461,9 @@ void *handle_append_entry_rpc(int sock){
         .term = current_term,
         .success = 0,
     };
+
+    int entry_index = message.entries.index;
+
     if (message.term < current_term){
         // Reply false if term < currentTerm
     }
@@ -339,29 +477,30 @@ void *handle_append_entry_rpc(int sock){
         // but different terms), delete the existing entry and all that
         // follow it (§5.3)
 
-        int entry_ind = message.entries.index;
-        if (entry_ind >= log_arr.size){
-            update_log_size(&log_arr);
+        if (entry_index != -1) { // lets differentiate heartbeats by this 
+            if (entry_index >= log_arr.size){
+                increase_log_size(&log_arr);
+            }
+            if (eq_entries(log_arr.entries[entry_index], message.entries)){
+                memset(&log_arr.entries[entry_index], 0,
+                 (log_arr.last - entry_index) * sizeof(entry_t));
+                log_arr.last = entry_index;
+            }
+            
+            // 4. Append any new entries not already in the log
+            push_back(&log_arr, message.entries);
         }
-        if (eq_entries(log_arr.entries[entry_ind], message.entries)){
-            memset(&log_arr.entries[entry_ind], 0, (log_arr.last - entry_ind) * sizeof(log_t));
-            log_arr.last = entry_ind;
-        }
-        
-        // 4. Append any new entries not already in the log
-        response.success = 1;
-        push_back(&log_arr, message.entries);
-
         // 5. If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)
         if (message.leader_commit > commit_index){
-            commit_index = min(message.leader_commit, entry_ind);
+            commit_index = min(message.leader_commit, entry_index);
         }
+        response.success = 1;
     }
 
     rc = send(sock, &response, sizeof(response), 0);
     if (rc <= 0){
-        perror("Error in handle_append_entry_rpc send");
+        perror("Error in handle_append_entries_rpc send");
         safe_leave(sock, NULL);
         return ((void *)EXIT_FAILURE);
     }
@@ -369,38 +508,23 @@ void *handle_append_entry_rpc(int sock){
     return ((void *) EXIT_SUCCESS);
 }
 
-void *rpc_handler(int fd, message_t *message, pthread_mutex_t *vote_mutex) {
+void *rpc_handler(int fd, pthread_mutex_t *vote_mutex) {
     // client_params_t *_client_params = arg;
     // client_params_t client_params = *_client_params;
     // pthread_mutex_unlock(&_client_params->mutex);
     
     int rc;
-    response_t response = {.val = 0,};
+    prepare_message_t message;
 
-    rc = recv(fd, message, sizeof(*message), 0);
+    rc = recv(fd, &message, sizeof(message), 0);
     if (rc <= 0) {
         printf("Failed\n");
         return ((void *)EXIT_FAILURE);
     }
 
-    printf("Received val %d, term %d, my term: %d\n", message->command.val,
-                                                      message->term,
-                                                      current_term);
-    if (message->term > current_term){
-        become_follower();
-    }
-
-    if (message->term >= current_term && State == Candidate &&
-        (message->type == AppendEntries || message->type == HeartBeat)){
-        become_follower();
-    }
-
-    if (message->term < current_term){
-        // NOTE: should be ignored
-    }
-
+    printf("Received prep message from %d, my term: %d\n", message.from, current_term);
     // Differentiate between clients and leader/other servers
-    switch (message->whom){
+    switch (message.whom){
         case Client:;
             // handle client
             break;
@@ -409,126 +533,16 @@ void *rpc_handler(int fd, message_t *message, pthread_mutex_t *vote_mutex) {
             break;
         case Candidate:;  // Candidate can send only RequestVote (?)
             // handle candidate
-            //voted_for == NULL only in case we are followers
             pthread_mutex_lock(vote_mutex); 
-            if (!voted_for && message->term >= current_term){
-                voted_for = message->from;
-                response.val = 1;
-            }
-            rc = send(fd, &response, sizeof(response), 0);
-            if (rc <= 0){
-                perror("Ошибка вызова send в rpc_handler");
-            }
+            handle_request_vote_rpc(fd);
             pthread_mutex_unlock(vote_mutex); 
-
-            printf("Sending data to Candidate %d, response-val: %d\n", message->from,
-             response.val);
             break;
         case Leader:;
-            handle_append_entry_rpc(fd);
-            // handle leader
-            // rc = send(fd, &response, sizeof(response), 0);
-            // if (rc <= 0){
-            //     perror("Ошибка вызова send в rpc_handler");
-            // }
-            // printf("Sending data to Leader\n");
+            handle_append_entries_rpc(fd);
             break;
         default:;
             perror("Unknown peer");
     }
-    // I don't want to update term for stale candidate in election, looks like 
-    // it slows the election
-    if (State != Candidate){
-        current_term = max(message->term, current_term);
-    }
-    return ((void *)EXIT_SUCCESS);
-}
-
-// Do not rely on this function when using `sleep`
-double time_spent(clock_t start_time){
-    return (double)(clock() - start_time) / CLOCKS_PER_SEC;
-}
-
-void *append_entry_rpc(int sock, int ind){
-    message_t message;
-
-    int rc;
-    rc = send(sock, &message, sizeof(message), 0);
-    if (rc <= 0){
-        perror("Error in append entry send");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);
-    }
-
-    ae_rpc_response_t response;
-    rc = recv(sock, &response, sizeof(response), 0);
-    if (rc <= 0){
-        perror("Error in append entry recv");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);
-    }
-
-    if (response.term > current_term){
-        current_term = response.term;
-        become_follower();
-    }
-}
-
-// TODO: fix it
-void *send_heart_beat_rpc(int port){
-    printf("Send heart beat\n");
-    struct sockaddr_in peer;
-    peer.sin_family = AF_INET;
-    peer.sin_port = htons(port);
-    peer.sin_addr.s_addr = inet_addr(IP_ADDR);
-
-    int sock;
-    int rc;
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("ошибка вызова socket");
-        return ((void *)EXIT_FAILURE);
-    }
-
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-    rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
-    if (rc != 0) {
-        perror("ошибка вызова connect");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);        
-    }
-
-    rc = send_prep_message(sock, HeartBeat, State, SERVER_ID);
-    if (rc != EXIT_SUCCESS){
-        perror("Error send prep message in heartbeat");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);
-    }
-
-    message_t message = {
-        .type = HeartBeat,
-        .whom = Leader,
-        .term = current_term,
-        .leader_id = SERVER_ID,
-    };
-    rc = send(sock, &message, sizeof(message), 0);
-    if (rc <= 0) {
-        perror("ошибка вызова send");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);
-    }
-    printf("Send success\n");
-
-    response_t response;
-    rc = recv(sock, &response, sizeof(response), 0);
-    if (rc <= 0) {
-        perror("ошибка вызова recv");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);
-    }
-
-    flsh();
-    safe_leave(sock, NULL);
-    printf("Recieved %d\n", response.val);
     return ((void *)EXIT_SUCCESS);
 }
 
@@ -542,6 +556,7 @@ void *send_append_entries_rpc(int port, int follower_id){
 
     int sock;
     int rc;
+    int hearbeat = 0;
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         perror("ошибка вызова socket");
@@ -567,6 +582,10 @@ void *send_append_entries_rpc(int port, int follower_id){
 
     int prev_log_index = next_index[follower_id] - 1;
 
+    if (next_index[follower_id] >= log_arr.size){
+        increase_log_size(&log_arr);
+    }
+
     ae_rpc_message_t message = {
         .term = current_term,
         .leader_id = SERVER_ID,
@@ -575,6 +594,12 @@ void *send_append_entries_rpc(int port, int follower_id){
         .entries = log_arr.entries[next_index[follower_id]],
         .leader_commit = commit_index,        
     };
+
+    if (next_index[follower_id] >= last_log_index){  //heartbeat
+        message.entries.index = -1;
+        hearbeat = 1;
+    }
+
     rc = send(sock, &message, sizeof(message), 0);
     if (rc <= 0) {
         perror("ошибка вызова send");
@@ -597,8 +622,10 @@ void *send_append_entries_rpc(int port, int follower_id){
     }
     else {
         if (response.success) {
-            match_index[follower_id] = next_index[follower_id];
-            next_index[follower_id]++;
+            if (!hearbeat){
+                match_index[follower_id] = next_index[follower_id];
+                next_index[follower_id]++;
+            }
         }
         else {
             next_index[follower_id]--;
@@ -612,22 +639,37 @@ void *send_append_entries_rpc(int port, int follower_id){
 }
 
 
-void *send_heart_beat_rpc_to_all(){
-    // should be parallel
-    int i;
-    for (i = 0; i < NUMBER_OF_PORTS; i++){
-        if (i == SERVER_ID){ continue; }
-        send_heart_beat_rpc(KNOWN_PORTS[i]);
-    }
-}
+// void *send_heart_beat_rpc_to_all(){
+//     // should be parallel
+//     int i;
+//     for (i = 0; i < NUMBER_OF_PORTS; i++){
+//         if (i == SERVER_ID){ continue; }
+//         send_heart_beat_rpc(KNOWN_PORTS[i]);
+//     }
+// }
 
 void *send_append_entries_rpc_to_all(){
     // should be parallel
     int i;
     for (i = 0; i < NUMBER_OF_PORTS; i++){
         if (i == SERVER_ID){ continue; }
-        if (last_log_index >= next_index[i]){
-            send_append_entries_rpc(KNOWN_PORTS[i], i);
+        send_append_entries_rpc(KNOWN_PORTS[i], i);
+    }
+}
+
+void *send_request_vote_rpc_to_all(){
+    // TODO: Make it parallel
+    int i;
+    int rc;
+    for (i = 0; i < NUMBER_OF_PORTS && State == Candidate; i++){
+        if (i == SERVER_ID){ continue; }
+        // retry
+        int j;
+        for (j = 0; j < 2; j++){
+            rc = request_vote(KNOWN_PORTS[i]);
+            if (rc == EXIT_SUCCESS){
+                break;
+            }
         }
     }
 }
@@ -676,19 +718,7 @@ void *try_get_rpc(void *arg){
             perror("Error in accept");
             return ((void *)EXIT_FAILURE);
         }
-
-        // client_params_t client_params = {
-        //     .config = params.config,
-        //     .fd = fd,
-        // };
-        message_t message;
-
-        rc = rpc_handler(fd, &message, &_params->vote_mutex);
-
-        // TODO ? : interpret message result
-        // if (message.term > current_term){}
-        // _params->result = 0;
-
+        rc = rpc_handler(fd, &_params->vote_mutex);
         // In case we are not receiving heartbeats from leader,
         // we still want to initiate election 
         // (this case is possible, if we get the client message)
@@ -718,7 +748,7 @@ void *wrap_try_get_rpc(void *arg){
     // tuning the server
     memset(&local, 0, sizeof(struct sockaddr_in));
     local.sin_family = AF_INET;
-    local.sin_port = htons(SERVER_ID);
+    local.sin_port = htons(KNOWN_PORTS[SERVER_ID]);
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -726,7 +756,6 @@ void *wrap_try_get_rpc(void *arg){
         perror ("ошибка вызова socket");
         return ((void *)EXIT_FAILURE);
     }
-
 
     // make socket reusable. After `close(sock)` there is a timeout (due to OS)
     // when address becomes available to bind again. Thus, make it reusable to
@@ -774,7 +803,7 @@ void mysleep(int ms){
     nanosleep(&ts, NULL);
 }
 
-void apply(log_t entry){
+void apply(entry_t entry){
     // apply entry to state machine
 }
 
@@ -785,16 +814,17 @@ int run_server(config_t *config) {
     try_get_rpc_t params;
     memset(&params, 0, sizeof(params));
 
-    while (commit_index > last_applied){
-        last_applied++;
-        apply(log_arr.entries[last_applied]);
-    }
-
     pthread_mutex_init(&params.mutex, NULL);
     pthread_mutex_init(&params.vote_mutex, NULL);
 
     for (current_term;current_term < 15;) {
         printf("Current term %d\n", current_term);
+
+        while (commit_index > last_applied){
+            last_applied++;
+            apply(log_arr.entries[last_applied]);
+        }
+
         int i = 0;
         int rc;
         pthread_t thread;
@@ -821,42 +851,34 @@ int run_server(config_t *config) {
                 // election, trying to get votes.
                 // in case we got rpc to become follower
                 // in try_get_rpc thread stop requesting
-
-                // TODO: Make it parallel
-                for (i = 0; i < NUMBER_OF_PORTS && State == Candidate; i++){
-                    if (KNOWN_PORTS[i] != SERVER_ID){
-                        response_t response = {.val = 0};
-                        int j;
-                        // retry
-                        for (j = 0; j < 2; j++){
-                            rc = request_vote(KNOWN_PORTS[i], &response);
-                            if (rc == EXIT_SUCCESS){
-                                break;
-                            }
-                        }
-                        votes += response.val;
-                    }
-                }
+                send_request_vote_rpc_to_all();
                 
                 // first outcome in perfect situation 
                 // (no other server is claimed as leader)
                 if (votes > NUMBER_OF_PORTS / 2 && State == Candidate){
-                    printf("Become Leader, votes = %d\n", votes);
-                    State = Leader;
+                    become_leader();
                 }
 
                 // pthread_kill will free mutex
                 pthread_mutex_lock(&params.vote_mutex);
                 rc = pthread_kill(thread, NULL);
                 if (rc != 0){
-                    perror("Error in pthread_join");
+                    perror("Error in pthread_kill");
                 }
                 pthread_mutex_unlock(&params.vote_mutex);
                 break;
             case Leader:;
                 printf("I'm Leader <<<<<<<<<<<<<<<\n");
+                // TODO:
+                // If there exists an N such that N > commitIndex, a majority
+                // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+                // set commitIndex = N (§5.3, §5.4).
+
+
+
                 timestamp();
                 // leader actions
+                int heartbeat = 0;
                 send_append_entries_rpc_to_all();
                 // for (i = 0; i < NUMBER_OF_PORTS; i++){
                 //     if (KNOWN_PORTS[i] != SERVER_ID){
@@ -866,6 +888,11 @@ int run_server(config_t *config) {
                 flsh();
                 // used for testing
                 printf("Leader sleeping\n");
+
+                // simulate incoming message from client (append entry by now)
+                entry_t entry = make_entry(gen_command(), current_term, log_arr.last);
+                push_back(&log_arr, entry);
+
                 sleep(5);
                 break;
             default:
@@ -875,7 +902,8 @@ int run_server(config_t *config) {
         flsh();
         current_term++;
     }
-    // close(sock);
+
+    print_log(log_arr);
 }
 
 int parse_str(int *num, char *str){
@@ -908,7 +936,7 @@ int main(int argc, char * argv[]){
     
     log_arr.size = DEFAULT_LOG_SIZE;
     log_arr.last = 1;
-    log_arr.entries = (log_t *)malloc(sizeof(log_t) * DEFAULT_LOG_SIZE);
+    log_arr.entries = (entry_t *)malloc(sizeof(entry_t) * DEFAULT_LOG_SIZE);
 
     int rc = run_server(&config);
     if (rc != 0){
