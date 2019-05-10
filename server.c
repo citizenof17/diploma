@@ -17,6 +17,7 @@
 #include <time.h>
 
 #define DEFAULT_PORT (7500)
+#define CLIENT_PORT (8000)
 #define DEFAULT_LOG_SIZE (100)
 #define BAD_PORT (1)
 #define MAX_PORT (65535)
@@ -75,6 +76,11 @@ typedef struct prepare_message_t {
     whom_e whom;
     int from;
 } prepare_message_t;
+
+typedef struct prepare_message_client_t {
+    int ready;
+    int leader_id;
+} prepare_message_client_t;
 
 typedef struct entry_t {
     int term;
@@ -150,6 +156,54 @@ typedef struct message_t {
     command_t command;
 } message_t;
 
+typedef struct entry_received_t {
+    int term;
+    int index;
+    int commited;
+} entry_received_t;
+
+struct deque_entry_t;
+
+typedef struct deque_entry_t {
+    entry_t entry;
+    struct deque_entry_t *next;
+} deque_entry_t;
+
+typedef struct deque_t {
+    deque_entry_t *first;
+    deque_entry_t *last;
+} deque_t;
+
+void *deque_add(deque_t *deque, entry_t entry){
+    deque_entry_t *dentry = (deque_entry_t *)malloc(sizeof(deque_entry_t));
+    dentry->entry = entry;
+    dentry->next = NULL;
+
+    if (deque->last == NULL){
+        deque->last = dentry;
+    }
+    else{
+        deque->last = deque->last->next = dentry;
+    }
+
+    if (deque->first == NULL){
+        deque->first = deque->last;
+    }
+}
+
+void *deque_pop(deque_t *deque){
+    deque_entry_t *del_dentry = deque->first;
+    if (del_dentry != NULL){
+        deque->first = del_dentry->next;
+        free(del_dentry);
+    }
+}
+
+void *clear_deque(deque_t *deque){
+    while (deque->first != NULL){
+        deque_pop(deque);
+    }
+}
 
 whom_e State = Follower;
 
@@ -157,6 +211,11 @@ whom_e State = Follower;
 int SERVER_ID;
 int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501};
 int leader = 0;
+deque_t client_requests;  // needed to store all unresponded commands from client
+                          // it's stored until not commited, after commit - send
+                          // client a notification that this entry is commited
+                          // but this doubles memory used for entries
+int leader_id;
 
 int last_log_index = 0; // this sohuld be equal to log_arr.last - 1
                         // index of last written log entry
@@ -204,6 +263,7 @@ void push_back(log_arr_t *logg, entry_t entry){
     logg->entries[logg->last++] = entry;
     last_log_index = entry.index;
     last_log_term = entry.term;
+    match_index[SERVER_ID] = last_log_index;
 }
 
 void print_command(command_t command){
@@ -220,6 +280,7 @@ void print_log(log_arr_t logg){
     printf("===================\n");
     printf("|| Printing log   ||\n");
     printf("===================\n");
+    printf("Commitindex: %d\n\n", commit_index);
     printf("Log size: %d, log last %d\n", logg.size, logg.last);
     printf("\n");
     for (i = 0; i <= logg.last; i++){
@@ -278,16 +339,21 @@ int safe_leave(int sock, pthread_mutex_t *mutex){
     return (EXIT_SUCCESS);
 }
 
-void become_follower(){
+void become_follower(int new_leader_id){
     printf("Become follower\n");
     State = Follower;
     voted_for = 0;
     votes = 0;
+    if (new_leader_id != -1){
+        leader_id = new_leader_id;
+    }
+    clear_deque(&client_requests);
 }
 
 void become_leader(){
     printf("Become Leader, votes = %d\n", votes);
     State = Leader;
+    leader_id = SERVER_ID;
     int i;
     for (i = 0; i < NUMBER_OF_PORTS; i++){
         if (i != SERVER_ID){
@@ -328,7 +394,8 @@ int send_prep_message(int sock, type_e type, whom_e whom, int from){
     return (EXIT_SUCCESS);
 }
 
-int request_vote(int port){
+int request_vote(int receiver_id){
+    int port = KNOWN_PORTS[receiver_id];
     printf("Request vote rpc %d\n", port);
     struct sockaddr_in peer;
     peer.sin_family = AF_INET;
@@ -381,12 +448,12 @@ int request_vote(int port){
 
     if (response.term > current_term){
         current_term = response.term;
-        become_follower();
+        become_follower(receiver_id);
     }
 
     votes += response.vote_granted;
     safe_leave(sock, NULL);
-    printf("Recieved %d\n", response.vote_granted);
+    printf("Received %d\n", response.vote_granted);
     return (EXIT_SUCCESS);
 }
 
@@ -438,7 +505,7 @@ void *handle_request_vote_rpc(int sock){
 }
 
 void *handle_append_entries_rpc(int sock){
-    printf("Handling append entry rpc");
+    printf("Handling append entry rpc\n");
 
     int rc;
     int ready = 1;
@@ -489,6 +556,10 @@ void *handle_append_entries_rpc(int sock){
             
             // 4. Append any new entries not already in the log
             push_back(&log_arr, message.entries);
+            printf("==========\n");
+            printf("Received entry from leader:\n");
+            print_entry(message.entries);
+            printf("==========\n");
         }
         // 5. If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)
@@ -496,6 +567,7 @@ void *handle_append_entries_rpc(int sock){
             commit_index = min(message.leader_commit, entry_index);
         }
         response.success = 1;
+        become_follower(message.leader_id);
     }
 
     rc = send(sock, &response, sizeof(response), 0);
@@ -506,6 +578,57 @@ void *handle_append_entries_rpc(int sock){
     }
 
     return ((void *) EXIT_SUCCESS);
+}
+
+void *handle_client(int sock){
+    int rc;
+    prepare_message_client_t response = {
+        .ready = 0,
+        .leader_id = leader_id,
+    };
+
+    if (leader_id == SERVER_ID){
+        // we are leader, handle client
+        response.ready = 1;
+    }
+    rc = send(sock, &response, sizeof(response), 0);
+    if (rc <= 0){
+        perror("Error in send in handle_client");
+        return ((void *)EXIT_FAILURE);
+    }
+
+    if (leader_id != SERVER_ID){
+        return ((void *)EXIT_SUCCESS);
+    }
+
+    // we are leadet and can recieve command from client
+
+    command_t command;
+    rc = recv(sock, &command, sizeof(command), 0);
+    if (rc <= 0){
+        perror("Error in recv in handle_client");
+        return ((void *)EXIT_FAILURE);
+    }
+
+    entry_t entry = make_entry(command, current_term, log_arr.last);
+    push_back(&log_arr, entry);
+    printf("===========\n");
+    printf("Received entry from client\n");
+    print_entry(entry);
+    printf("===========\n");
+    deque_add(&client_requests, entry);
+
+    entry_received_t entry_received = {
+        .term = entry.term,
+        .index = entry.index,
+        .commited = 0,
+    };
+    rc = send(sock, &entry_received, sizeof(entry_received), 0);
+    if (rc <= 0){
+        perror("Error in send in handle_client");
+        return ((void *)EXIT_FAILURE);
+    }
+    return ((void *)EXIT_SUCCESS);
 }
 
 void *rpc_handler(int fd, pthread_mutex_t *vote_mutex) {
@@ -527,6 +650,7 @@ void *rpc_handler(int fd, pthread_mutex_t *vote_mutex) {
     switch (message.whom){
         case Client:;
             // handle client
+            handle_client(fd);
             break;
         case Follower:;  // Follower can only redirect clients (?)
             // handle follower
@@ -618,7 +742,7 @@ void *send_append_entries_rpc(int port, int follower_id){
 
     if (response.term > current_term){
         current_term = response.term;
-        become_follower();
+        become_follower(follower_id);
     }
     else {
         if (response.success) {
@@ -634,19 +758,9 @@ void *send_append_entries_rpc(int port, int follower_id){
     }
     flsh();
     safe_leave(sock, NULL);
-    printf("Recieved %d\n", response.success);
+    printf("Received %d\n", response.success);
     return ((void *)EXIT_SUCCESS);
 }
-
-
-// void *send_heart_beat_rpc_to_all(){
-//     // should be parallel
-//     int i;
-//     for (i = 0; i < NUMBER_OF_PORTS; i++){
-//         if (i == SERVER_ID){ continue; }
-//         send_heart_beat_rpc(KNOWN_PORTS[i]);
-//     }
-// }
 
 void *send_append_entries_rpc_to_all(){
     // should be parallel
@@ -666,7 +780,7 @@ void *send_request_vote_rpc_to_all(){
         // retry
         int j;
         for (j = 0; j < 2; j++){
-            rc = request_vote(KNOWN_PORTS[i]);
+            rc = request_vote(i);
             if (rc == EXIT_SUCCESS){
                 break;
             }
@@ -807,6 +921,62 @@ void apply(entry_t entry){
     // apply entry to state machine
 }
 
+void *respond_to_client(void *arg){
+    int rc;
+    while(client_requests.first != NULL && 
+     client_requests.first->entry.index <= commit_index){
+        entry_t entry = client_requests.first->entry;
+
+        int port = CLIENT_PORT;
+        printf("Updating client with index %d\n", entry.index);
+        struct sockaddr_in peer;
+        peer.sin_family = AF_INET;
+        peer.sin_port = htons(port);
+        peer.sin_addr.s_addr = inet_addr(IP_ADDR);
+
+        int sock;
+        if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            perror("ошибка вызова socket");
+            safe_leave(sock, NULL);
+            return ((void *)EXIT_FAILURE);
+        }
+
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+        int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
+        if (rc != 0) {
+            perror("ошибка вызова connect");
+            safe_leave(sock, NULL);
+            return ((void *)EXIT_FAILURE);        
+        }
+        printf("Connected %d %d\n", SERVER_ID, port);
+        entry_received_t entry_received = {
+            .index = entry.index,
+            .term = entry.term,
+            .commited = 1,
+        };
+
+        rc = send(sock, &entry_received, sizeof(entry_received), 0);
+        if (rc <= 0) {
+            perror("ошибка вызова send");
+            safe_leave(sock, NULL);
+            return ((void *)EXIT_FAILURE);
+        }
+
+        safe_leave(sock, NULL);
+        printf("Entry with index %d is sent to client\n", entry.index);
+        return ((void *)EXIT_SUCCESS);
+    }
+}
+
+void *update_client(pthread_mutex_t *client_mutex){
+    printf("Update client\n");
+
+    pthread_t thread;
+    pthread_mutex_lock(client_mutex);
+    pthread_create(&thread, NULL, respond_to_client, NULL);
+    pthread_mutex_unlock(client_mutex);
+}
+
 int run_server(config_t *config) {
     printf("Running %d\n", config->port);
 
@@ -814,8 +984,10 @@ int run_server(config_t *config) {
     try_get_rpc_t params;
     memset(&params, 0, sizeof(params));
 
+    pthread_mutex_t client_mutex;
     pthread_mutex_init(&params.mutex, NULL);
     pthread_mutex_init(&params.vote_mutex, NULL);
+    pthread_mutex_init(&client_mutex, NULL);
 
     for (current_term;current_term < 15;) {
         printf("Current term %d\n", current_term);
@@ -833,7 +1005,7 @@ int run_server(config_t *config) {
             case Follower:;
                 printf("I'm Follower\n");
                 timestamp();
-                become_follower();
+                // become_follower(leader_id);
                 params.follower = 1;
                 printf("Waiting for incoming messages\n");
                 wrap_try_get_rpc(&params);
@@ -869,36 +1041,49 @@ int run_server(config_t *config) {
                 break;
             case Leader:;
                 printf("I'm Leader <<<<<<<<<<<<<<<\n");
-                // TODO:
+                timestamp();
+                update_client(&client_mutex);
+
+                // leader actions
+                int heartbeat = 0;
+                send_append_entries_rpc_to_all();
+                flsh();
+                
+                // simulate incoming message from client (append entry by now)
+                entry_t entry = make_entry(gen_command(), current_term, log_arr.last);
+                push_back(&log_arr, entry);
+                printf("===========\n");
+                printf("Generated entry\n");
+                print_entry(entry);
+                printf("===========\n");
+                
+                // used for testing
+                                
                 // If there exists an N such that N > commitIndex, a majority
                 // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
                 // set commitIndex = N (§5.3, §5.4).
 
+                int new_ci = commit_index;
+                for(new_ci; new_ci <= last_log_index; new_ci++){
+                    int j;
+                    int cnt = 0;
+                    for (j = 0; j < NUMBER_OF_PORTS; j++){
+                        cnt += (match_index[j] >= new_ci); // && log_arr.entries[new_ci].term == current_term);  // TODO: do we need this condition?
+                    }
+                    if (cnt > NUMBER_OF_PORTS / 2){
+                        commit_index = new_ci;
+                        printf("Commit index is updated: %d\n", commit_index);
+                    }
+                }
 
-
-                timestamp();
-                // leader actions
-                int heartbeat = 0;
-                send_append_entries_rpc_to_all();
-                // for (i = 0; i < NUMBER_OF_PORTS; i++){
-                //     if (KNOWN_PORTS[i] != SERVER_ID){
-                //         send_append_entries_rpc(KNOWN_PORTS[i]);
-                //     }
-                // }
-                flsh();
-                // used for testing
                 printf("Leader sleeping\n");
-
-                // simulate incoming message from client (append entry by now)
-                entry_t entry = make_entry(gen_command(), current_term, log_arr.last);
-                push_back(&log_arr, entry);
-
                 sleep(5);
                 break;
             default:
                 printf("Unknown state %d", State);
                 break;
         }
+
         flsh();
         current_term++;
     }

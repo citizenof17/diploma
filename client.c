@@ -9,20 +9,9 @@
 #include <string.h>
 #include <ctype.h>
 
-#define DEFAULT_PORT (7500)
 #define IP_ADDR ("127.0.0.1")
 
-typedef struct command_t {
-    int val;
-} command_t;
-
-typedef struct response_t {
-    int val;
-} response_t;
-
-typedef struct config_t {
-    int port;
-} config_t;
+int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501, 7502};
 
 typedef struct client_params_t {
     // struct sockaddr_in *peer;
