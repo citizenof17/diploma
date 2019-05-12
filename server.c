@@ -24,8 +24,11 @@
 #define IP_ADDR ("127.0.0.1")
 #define MAX_CLIENTS (5)
 #define NUMBER_OF_PORTS (2)
-#define SELECT_TIMEOUT (5.0)    // in seconds
-#define ELECTION_TIMEOUT (10.0)  // in seconds
+#define TERM_TIMEOUT (15) //in seconds
+#define APPEND_ENTRIES_TIMEOUT (3000) // in milliseconds
+#define SELECT_TIMEOUT (10)    // in seconds
+#define CONNECT_TIMEOUT (3) // in seconds
+#define ELECTION_TIMEOUT (5.0)  // in seconds
 #define CANDIDATE_TIMEOUT (5000) // in milliseconds
 #define RECV_TIMEOUT (2)         // in seconds
 #define min(x, y) (((x) < (y)) ? (x) : (y))
@@ -61,6 +64,11 @@ struct timespec timeout = {
     .tv_nsec = 0,
 };
 
+struct timespec connect_timeout = {
+    .tv_sec = CONNECT_TIMEOUT,
+    .tv_nsec = 0,
+};
+
 struct timeval recv_timeout = {
     .tv_sec = RECV_TIMEOUT,
     .tv_usec = 0,
@@ -75,6 +83,7 @@ typedef struct prepare_message_t {
     type_e type;
     whom_e whom;
     int from;
+    int term;
 } prepare_message_t;
 
 typedef struct prepare_message_client_t {
@@ -156,6 +165,11 @@ typedef struct message_t {
     command_t command;
 } message_t;
 
+typedef struct mutex_id_t {
+    pthread_mutex_t mutex;
+    int id;
+} mutex_id_t;
+
 typedef struct entry_received_t {
     int term;
     int index;
@@ -221,7 +235,7 @@ int last_log_index = 0; // this sohuld be equal to log_arr.last - 1
                         // index of last written log entry
 int last_log_term = 0;  // term of last entry in log
 
-int current_term = 0;
+int current_term = 1;
 int voted_for = 0;
 log_arr_t log_arr;
 int votes = 0;
@@ -229,10 +243,11 @@ int votes = 0;
 int commit_index = 0;
 int last_applied = 0;
 
-int next_index[NUMBER_OF_PORTS] = {0, 0, 0};
-int match_index[NUMBER_OF_PORTS] = {0, 0, 0};
+int next_index[NUMBER_OF_PORTS] = {1, 1};
+int match_index[NUMBER_OF_PORTS] = {0, 0};
 
 clock_t last_heartbeat;
+time_t last_heartbeat_time;
 
 command_t gen_command(){
     command_t command = {
@@ -254,6 +269,31 @@ void increase_log_size(log_arr_t *logg){
     logg->entries = 
         (entry_t *)realloc(logg->entries, 2 * logg->size * sizeof(entry_t));
     logg->size *= 2;
+}
+
+void become_follower(int new_leader_id, clock_t timer){
+    printf("Become follower\n");
+    if (timer != -1){
+        last_heartbeat = timer;
+        time(&last_heartbeat_time);
+    }
+    State = Follower;
+    voted_for = 0;
+    votes = 0;
+    if (new_leader_id != -1){
+        leader_id = new_leader_id;
+    }
+    clear_deque(&client_requests);
+}
+
+int update_self_to_follower(int new_term, int new_leader_id){
+    if (new_term > current_term){
+        printf("Updating self to follower, new_term: %d, old term %d; ", new_term, current_term);
+        become_follower(new_leader_id, clock());
+        current_term = new_term;
+        return 1; //updated
+    }
+    return 0; //not updated
 }
 
 void push_back(log_arr_t *logg, entry_t entry){
@@ -283,7 +323,7 @@ void print_log(log_arr_t logg){
     printf("Commitindex: %d\n\n", commit_index);
     printf("Log size: %d, log last %d\n", logg.size, logg.last);
     printf("\n");
-    for (i = 0; i <= logg.last; i++){
+    for (i = 0; i < logg.last; i++){
         printf("Index %d: \n", i);
         print_entry(logg.entries[i]);
     }
@@ -295,6 +335,14 @@ void print_log(log_arr_t logg){
 
 float rand_in_range(float a, float b){
     return a + (float)(rand())/(float)(RAND_MAX) * (b - a);
+}
+
+void mysleep(int ms){
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    last_heartbeat -= (clock_t)((double)ms / 1000.0 * CLOCKS_PER_SEC);
+    nanosleep(&ts, NULL);
 }
 
 void flsh(){
@@ -311,6 +359,11 @@ double time_spent(clock_t start_time){
     return (double)(clock() - start_time) / CLOCKS_PER_SEC;
 }
 
+/* return time spent in seconds */
+double time_spent_time(time_t start_time){  
+    return time(NULL) - start_time;
+}
+
 int eq_command(const command_t a, const command_t b){
     return a.val == b.val;
 }
@@ -321,7 +374,7 @@ int eq_entries(const entry_t a, const entry_t b){
         a.term == b.index;
 }
 
-int safe_leave(int sock, pthread_mutex_t *mutex){
+int safe_leave(int sock, pthread_mutex_t *mutex, int ind){
     int rc;
     rc = close(sock);
     if (rc == -1){
@@ -333,21 +386,13 @@ int safe_leave(int sock, pthread_mutex_t *mutex){
             perror("Error in unlock");
             return (EXIT_FAILURE);
         }
-        printf("Leaving wrap_try_get_rpc -------------------^\n");
+        printf("Mutex is unlocked in safe_leave\n");
+        if (ind != -1){
+            printf("Leaving wrap_try_get_rpc -------------------^ %d\n", ind);
+        }
     }
     flsh();
     return (EXIT_SUCCESS);
-}
-
-void become_follower(int new_leader_id){
-    printf("Become follower\n");
-    State = Follower;
-    voted_for = 0;
-    votes = 0;
-    if (new_leader_id != -1){
-        leader_id = new_leader_id;
-    }
-    clear_deque(&client_requests);
 }
 
 void become_leader(){
@@ -362,9 +407,9 @@ void become_leader(){
     }
 }
 
-void initiate_election(config_t *config){
+void initiate_election(){
     printf("Initiate election\n");
-    // current_term++;
+    current_term++;
     State = Candidate;
     voted_for = SERVER_ID;
     votes = 1;
@@ -375,7 +420,8 @@ int send_prep_message(int sock, type_e type, whom_e whom, int from){
     prepare_message_t prep_mess = { 
         .type = type,
         .whom = whom,
-        .from = from
+        .from = from,
+        .term = current_term,
     };
     int rc;
     rc = send(sock, &prep_mess, sizeof(prep_mess), 0);
@@ -387,6 +433,14 @@ int send_prep_message(int sock, type_e type, whom_e whom, int from){
     int ready = 0;
     rc = recv(sock, &ready, sizeof(ready), 0);
     if (rc <= 0 || !ready){
+        // if 'Resource temporarily unavailable':
+        // The socket is marked nonblocking and the receive operation
+        // would block, or a receive timeout had been set and the timeout
+        // expired before data was received.  POSIX.1 allows either error
+        // to be returned for this case, and does not require these
+        // constants to have the same value, so a portable application
+        // should check for both possibilities.
+        // http://man7.org/linux/man-pages/man2/recvmsg.2.html
         perror("Error in recv in send prep message");
         return (EXIT_FAILURE);
     }
@@ -394,7 +448,40 @@ int send_prep_message(int sock, type_e type, whom_e whom, int from){
     return (EXIT_SUCCESS);
 }
 
-int request_vote(int receiver_id){
+int connect_with_timeout(int sock, struct sockaddr_in *address){
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+    connect(sock, (struct sockaddr *)address, sizeof(*address));
+    
+    fd_set fdset;
+    FD_ZERO(&fdset);
+    FD_SET(sock, &fdset);
+
+    int rc = pselect(sock + 1, NULL, &fdset, NULL, &connect_timeout, NULL);
+    if (rc <= 0){
+        return (EXIT_FAILURE);
+    }
+
+    if (FD_ISSET(sock, &fdset)){
+        // connected, set back to blocking 
+        int opts = fcntl(sock, F_GETFL);
+        if (opts < 0){
+            perror("Error in getting opts");
+            return (EXIT_FAILURE);
+        }
+        opts &= (~O_NONBLOCK);
+        rc = fcntl(sock, F_SETFL, opts);
+        if (rc < 0){
+            perror("Error in setting back to blocking");
+            return (EXIT_FAILURE);
+        }
+    }
+    else{
+        return (EXIT_FAILURE);
+    }
+    return (EXIT_SUCCESS);
+}
+
+int send_request_vote(int receiver_id){
     int port = KNOWN_PORTS[receiver_id];
     printf("Request vote rpc %d\n", port);
     struct sockaddr_in peer;
@@ -403,24 +490,26 @@ int request_vote(int receiver_id){
     peer.sin_addr.s_addr = inet_addr(IP_ADDR);
 
     int sock;
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
         perror("ошибка вызова socket");
-        safe_leave(sock, NULL);
+        safe_leave(sock, NULL, -1);
         return (EXIT_FAILURE);
     }
 
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-    int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
+    int rc = connect_with_timeout(sock, &peer);
+    // int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
     if (rc != 0) {
-        perror("ошибка вызова connect");
-        safe_leave(sock, NULL);
+        perror("ошибка вызова connect with timeout");
+        safe_leave(sock, NULL, -1);
         return (EXIT_FAILURE);        
     }
-    printf("Connected %d %d\n", SERVER_ID, port);
-    rc = send_prep_message(sock, RequestVote, Candidate, SERVER_ID);
+    printf("Connected to %d\n", port);
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+    rc = send_prep_message(sock, RequestVote, State, SERVER_ID);
     if (rc != EXIT_SUCCESS){
         perror("Error in prep message in request vote");
-        safe_leave(sock, NULL);
+        safe_leave(sock, NULL, -1);
         return (EXIT_FAILURE);
     }
 
@@ -434,7 +523,7 @@ int request_vote(int receiver_id){
     rc = send(sock, &message, sizeof(message), 0);
     if (rc <= 0) {
         perror("ошибка вызова send");
-        safe_leave(sock, NULL);
+        safe_leave(sock, NULL, -1);
         return (EXIT_FAILURE);
     }
 
@@ -442,28 +531,25 @@ int request_vote(int receiver_id){
     rc = recv(sock, &response, sizeof(response), 0);
     if (rc <= 0) {
         perror("ошибка вызова recv");
-        safe_leave(sock, NULL);        
+        safe_leave(sock, NULL, -1);        
         return (EXIT_FAILURE);
     }
 
-    if (response.term > current_term){
-        current_term = response.term;
-        become_follower(receiver_id);
-    }
+    update_self_to_follower(response.term, -1);
 
     votes += response.vote_granted;
-    safe_leave(sock, NULL);
+    safe_leave(sock, NULL, -1);
     printf("Received %d\n", response.vote_granted);
     return (EXIT_SUCCESS);
 }
 
 void *handle_request_vote_rpc(int sock){
     int rc;
+    //notify that we are ready to receive data
     int ready = 1;
     rc = send(sock, &ready, sizeof(ready), 0);
     if (rc <= 0){
         perror("Ошибка вызова send в handle_request_vote_rpc");
-        safe_leave(sock, NULL);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -471,7 +557,7 @@ void *handle_request_vote_rpc(int sock){
     rc = recv(sock, &message, sizeof(message), 0);
     if (rc <= 0) {
         perror("Error in handle_request_vote_rpc recv");
-        safe_leave(sock, NULL);
+        // memset(&message, 0, sizeof(message));
         return ((void *)EXIT_FAILURE);
     }
 
@@ -490,14 +576,16 @@ void *handle_request_vote_rpc(int sock){
         message.last_log_index >= last_log_index && 
         message.last_log_term >= last_log_term){
             response.vote_granted = 1;
+            become_follower(-1, clock());
         }
     }
-
+    
+    printf("Sending data to Candidate with term %d, my term %d, vote_granted: %d\n",
+     message.term, current_term, response.vote_granted);
+    current_term = max(current_term, message.term);    
     rc = send(sock, &response, sizeof(response), 0);
-    printf("Sending data to Candidate vote_granted: %d\n",response.vote_granted);
     if (rc <= 0){
         perror("Error in handle_request_vote_rpc send");
-        safe_leave(sock, NULL);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -505,14 +593,14 @@ void *handle_request_vote_rpc(int sock){
 }
 
 void *handle_append_entries_rpc(int sock){
-    printf("Handling append entry rpc\n");
+    printf("Handling append entries rpc\n");
 
     int rc;
     int ready = 1;
     rc = send(sock, &ready, sizeof(ready), 0);
     if (rc <= 0){
         perror("Ошибка вызова send в handle_append_entries_rpc");
-        safe_leave(sock, NULL);
+        // safe_leave(sock, NULL);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -520,7 +608,8 @@ void *handle_append_entries_rpc(int sock){
     rc = recv(sock, &message, sizeof(message), 0);
     if (rc <= 0) {
         perror("Error in handle_append_entries_rpc recv");
-        safe_leave(sock, NULL);
+        memset(&message, 0, sizeof(message));
+        // safe_leave(sock, NULL);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -533,9 +622,10 @@ void *handle_append_entries_rpc(int sock){
 
     if (message.term < current_term){
         // Reply false if term < currentTerm
+        printf("handle_append_entries_rpc: message.term %d < current_term %d\n", message.term, current_term);
     }
-    else if (log_arr.size <= message.prev_log_index || 
-             log_arr.entries[message.prev_log_index].term != message.prev_log_term){
+    else if (log_arr.last <= message.prev_log_index || (log_arr.last > message.prev_log_index &&
+             log_arr.entries[message.prev_log_index].term != message.prev_log_term)){
         // 2. Reply false if log doesn’t contain an entry at prevLogIndex
         // whose term matches prevLogTerm (§5.3)
     }
@@ -548,9 +638,9 @@ void *handle_append_entries_rpc(int sock){
             if (entry_index >= log_arr.size){
                 increase_log_size(&log_arr);
             }
-            if (eq_entries(log_arr.entries[entry_index], message.entries)){
+            if (!eq_entries(log_arr.entries[entry_index], message.entries)){
                 memset(&log_arr.entries[entry_index], 0,
-                 (log_arr.last - entry_index) * sizeof(entry_t));
+                 (log_arr.last - entry_index + 1) * sizeof(entry_t));
                 log_arr.last = entry_index;
             }
             
@@ -560,20 +650,27 @@ void *handle_append_entries_rpc(int sock){
             printf("Received entry from leader:\n");
             print_entry(message.entries);
             printf("==========\n");
+
+            response.success = 1;
+        }
+        else{
+            printf("==========\n");
+            printf("Heartbeat\n");
+            printf("==========\n");
         }
         // 5. If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)
         if (message.leader_commit > commit_index){
-            commit_index = min(message.leader_commit, entry_index);
+            commit_index = min(message.leader_commit, last_log_index);
         }
-        response.success = 1;
-        become_follower(message.leader_id);
+        become_follower(message.leader_id, clock());
     }
 
+    printf("Handling in append_entries_rpc is done, return\n");
     rc = send(sock, &response, sizeof(response), 0);
     if (rc <= 0){
         perror("Error in handle_append_entries_rpc send");
-        safe_leave(sock, NULL);
+        // safe_leave(sock, NULL);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -581,6 +678,9 @@ void *handle_append_entries_rpc(int sock){
 }
 
 void *handle_client(int sock){
+
+    // MOCK. Not tested
+
     int rc;
     prepare_message_client_t response = {
         .ready = 0,
@@ -631,35 +731,30 @@ void *handle_client(int sock){
     return ((void *)EXIT_SUCCESS);
 }
 
-void *rpc_handler(int fd, pthread_mutex_t *vote_mutex) {
-    // client_params_t *_client_params = arg;
-    // client_params_t client_params = *_client_params;
-    // pthread_mutex_unlock(&_client_params->mutex);
-    
-    int rc;
+void *handle_rpc(int fd) {
     prepare_message_t message;
-
+    int rc;
     rc = recv(fd, &message, sizeof(message), 0);
     if (rc <= 0) {
         printf("Failed\n");
         return ((void *)EXIT_FAILURE);
     }
 
-    printf("Received prep message from %d, my term: %d\n", message.from, current_term);
+    update_self_to_follower(message.term, -1);
+
+    printf("Received prep message from %d\n", message.from);
     // Differentiate between clients and leader/other servers
     switch (message.whom){
         case Client:;
-            // handle client
             handle_client(fd);
             break;
         case Follower:;  // Follower can only redirect clients (?)
-            // handle follower
+            printf("Got message from follower!!!\n");  // Follower shouldn't initiate any rpc
+            int ready = 0;
+            send(fd, &ready, sizeof(ready), 0);
             break;
-        case Candidate:;  // Candidate can send only RequestVote (?)
-            // handle candidate
-            pthread_mutex_lock(vote_mutex); 
+        case Candidate:;  // Candidate can only send RequestVote (?)
             handle_request_vote_rpc(fd);
-            pthread_mutex_unlock(vote_mutex); 
             break;
         case Leader:;
             handle_append_entries_rpc(fd);
@@ -670,8 +765,12 @@ void *rpc_handler(int fd, pthread_mutex_t *vote_mutex) {
     return ((void *)EXIT_SUCCESS);
 }
 
-void *send_append_entries_rpc(int port, int follower_id){
-    printf("Send append entries\n");
+void *send_append_entries_rpc(void *arg){
+    mutex_id_t *_mutex_id = (mutex_id_t *)arg;
+    int follower_id = _mutex_id->id;
+    pthread_mutex_t *mutex = &_mutex_id->mutex;
+    printf("Send append entries to %d\n", follower_id);
+    int port = KNOWN_PORTS[follower_id];
 
     struct sockaddr_in peer;
     peer.sin_family = AF_INET;
@@ -681,93 +780,115 @@ void *send_append_entries_rpc(int port, int follower_id){
     int sock;
     int rc;
     int hearbeat = 0;
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("ошибка вызова socket");
-        return ((void *)EXIT_FAILURE);
-    }
+        
+    int i;
+    // send as much entries as possible, but atleast 1 for heartbeat
+    printf("last log index %d, next index %d\n", last_log_index,
+     next_index[follower_id]);
+    for (i = 0; i <= 0/*max(last_log_index - next_index[follower_id], 1)*/; i++){
+        printf("%d round of append entries to %d\n", i, follower_id);
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            perror("ошибка вызова socket");
+            return ((void *)EXIT_FAILURE);
+        }
 
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-    rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
-    if (rc != 0) {
-        perror("ошибка вызова connect");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);        
-    }
+        // setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+        rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
+        if (rc != 0) {
+            perror("ошибка вызова connect");
+            safe_leave(sock, NULL, -1);
+            return ((void *)EXIT_FAILURE);
+        }
 
-    // send notificiation message about incoming append entries:
+        pthread_mutex_lock(mutex);
+        // send notificiation message about incoming append entries:
+        rc = send_prep_message(sock, AppendEntries, State, SERVER_ID);
+        if (rc != (EXIT_SUCCESS)){
+            perror("Error in send prep message");
+            safe_leave(sock, mutex, -1);
+            return ((void *)EXIT_FAILURE);
+        }
 
-    rc = send_prep_message(sock, AppendEntries, State, SERVER_ID);
-    if (rc != (EXIT_SUCCESS)){
-        perror("Error in send prep message");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);
-    }
+        int prev_log_index = next_index[follower_id] - 1;
 
-    int prev_log_index = next_index[follower_id] - 1;
+        // this might happen whenn all entries are sent, but we still want to heartbeat
+        if (next_index[follower_id] >= log_arr.size){
+            increase_log_size(&log_arr);
+        }
 
-    if (next_index[follower_id] >= log_arr.size){
-        increase_log_size(&log_arr);
-    }
+        ae_rpc_message_t message = {
+            .term = current_term,
+            .leader_id = SERVER_ID,
+            .prev_log_index = prev_log_index,
+            .prev_log_term = log_arr.entries[prev_log_index].term,
+            .entries = log_arr.entries[next_index[follower_id]],
+            .leader_commit = commit_index,        
+        };
 
-    ae_rpc_message_t message = {
-        .term = current_term,
-        .leader_id = SERVER_ID,
-        .prev_log_index = prev_log_index,
-        .prev_log_term = log_arr.entries[prev_log_index].term,
-        .entries = log_arr.entries[next_index[follower_id]],
-        .leader_commit = commit_index,        
-    };
+        if (next_index[follower_id] >= last_log_index){  //heartbeat
+            message.entries.index = -1;
+            hearbeat = 1;
+        }
 
-    if (next_index[follower_id] >= last_log_index){  //heartbeat
-        message.entries.index = -1;
-        hearbeat = 1;
-    }
+        rc = send(sock, &message, sizeof(message), 0);
+        if (rc <= 0) {
+            perror("ошибка вызова send");
+            safe_leave(sock, mutex, -1);
+            return ((void *)EXIT_FAILURE);
+        }
+        printf("Send success\n");
 
-    rc = send(sock, &message, sizeof(message), 0);
-    if (rc <= 0) {
-        perror("ошибка вызова send");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);
-    }
-    printf("Send success\n");
+        ae_rpc_response_t response;
+        rc = recv(sock, &response, sizeof(response), 0);
+        if (rc <= 0) {
+            perror("ошибка вызова recv");
+            safe_leave(sock, mutex, -1);
+            return ((void *)EXIT_FAILURE);
+        }
 
-    ae_rpc_response_t response;
-    rc = recv(sock, &response, sizeof(response), 0);
-    if (rc <= 0) {
-        perror("ошибка вызова recv");
-        safe_leave(sock, NULL);
-        return ((void *)EXIT_FAILURE);
-    }
-
-    if (response.term > current_term){
-        current_term = response.term;
-        become_follower(follower_id);
-    }
-    else {
-        if (response.success) {
-            if (!hearbeat){
-                match_index[follower_id] = next_index[follower_id];
-                next_index[follower_id]++;
+        if (!update_self_to_follower(response.term, -1)){
+            if (response.success) {
+                if (!hearbeat){
+                    match_index[follower_id] = next_index[follower_id];
+                    next_index[follower_id]++;
+                }
+            }
+            else {
+                next_index[follower_id] = max(next_index[follower_id] - 1, 1);
+                // retry;
             }
         }
-        else {
-            next_index[follower_id]--;
-            // retry;
-        }
+        printf("Received %d\n", response.success);
+        pthread_mutex_unlock(mutex);
     }
+
     flsh();
-    safe_leave(sock, NULL);
-    printf("Received %d\n", response.success);
+    safe_leave(sock, NULL, -1);
     return ((void *)EXIT_SUCCESS);
 }
 
 void *send_append_entries_rpc_to_all(){
     // should be parallel
     int i;
+    pthread_t threads[NUMBER_OF_PORTS];
+    pthread_mutex_t mutexes[NUMBER_OF_PORTS];
+
     for (i = 0; i < NUMBER_OF_PORTS; i++){
         if (i == SERVER_ID){ continue; }
-        send_append_entries_rpc(KNOWN_PORTS[i], i);
+        pthread_mutex_init(&mutexes[i], NULL);
+
+        mutex_id_t mutex_id = {
+            .mutex = mutexes[i],
+            .id = i,
+        };
+        pthread_create(&threads[i], NULL, send_append_entries_rpc, &mutex_id);
+    }
+    mysleep(APPEND_ENTRIES_TIMEOUT);
+    for (i = 0; i < NUMBER_OF_PORTS; i++){
+        if (i == SERVER_ID){ continue; }
+        pthread_mutex_lock(&mutexes[i]);
+        pthread_cancel(threads[i]);
     }
 }
 
@@ -780,7 +901,7 @@ void *send_request_vote_rpc_to_all(){
         // retry
         int j;
         for (j = 0; j < 2; j++){
-            rc = request_vote(i);
+            rc = send_request_vote(i);
             if (rc == EXIT_SUCCESS){
                 break;
             }
@@ -792,6 +913,7 @@ typedef struct try_get_rpc_t {
     int sock;
     int result;
     int follower;
+    int ind;
     config_t * config;
     pthread_mutex_t mutex;
     pthread_mutex_t vote_mutex;
@@ -815,49 +937,59 @@ void *try_get_rpc(void *arg){
         return ((void *)EXIT_FAILURE);
     }
 
-    if (params.follower && sel == 0){
-        initiate_election(params.config);
+    if (State == Follower && sel == 0){
+        initiate_election();
         return ((void *)EXIT_SUCCESS);
     }
+
 
     if (FD_ISSET(sock, &sockets)){ 
         // struct sockaddr_in client_name;
         // socklen_t client_name_len;
         // int fd = accept(sock, &client_name, &client_name_len);
         int rc;
+        printf("Locking vote mutex in handle_rpc\n");
+        pthread_mutex_lock(&_params->vote_mutex);
+
         int fd = accept(sock, NULL, NULL);
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &recv_timeout, sizeof(recv_timeout));
         printf("accepted, got called in try_get_rpc\n");
+
         if (fd <= 0){
             perror("Error in accept");
-            return ((void *)EXIT_FAILURE);
+            // return ((void *)EXIT_FAILURE);
         }
-        rc = rpc_handler(fd, &_params->vote_mutex);
+        else{
+            rc = handle_rpc(fd);
+        }
         // In case we are not receiving heartbeats from leader,
         // we still want to initiate election 
         // (this case is possible, if we get the client message)
 
         // TODO: probably, some validation should be added to deal with
         // running election, when we've been set to follower
-        if (params.follower && time_spent(last_heartbeat) > ELECTION_TIMEOUT){
-            initiate_election(params.config);
+        if (State == Follower && time_spent_time(last_heartbeat_time) > ELECTION_TIMEOUT){
+            printf("Initiate election because of timeout\n");
+            initiate_election();
         }
-        close(fd);
+        printf("Unlocking vote mutex in handle_rpc\n");
+        safe_leave(fd, &_params->vote_mutex, -1);
     }
     return ((void *)EXIT_SUCCESS);
 }
 
 
 void *wrap_try_get_rpc(void *arg){
-    printf("wrap try get rpc -------------------v\n");
     try_get_rpc_t *_params = arg;
     try_get_rpc_t params = *_params;
+    printf("wrap try get rpc -------------------v %d\n", params.ind);
+    pthread_mutex_t *mutex = &_params->mutex;
     int rc;
-    rc = pthread_mutex_lock(&_params->mutex);
-    if (rc != 0){
-        perror("Error in lock");
-        return ((void *)EXIT_FAILURE);
-    }
+    printf("Locking mutex in wrap_try_get_rpc\n");
+    pthread_mutex_lock(mutex);
+    printf("Mutex is locked\n");
+
     struct sockaddr_in local;
     // tuning the server
     memset(&local, 0, sizeof(struct sockaddr_in));
@@ -868,17 +1000,19 @@ void *wrap_try_get_rpc(void *arg){
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         perror ("ошибка вызова socket");
+        safe_leave(sock, mutex, params.ind);
         return ((void *)EXIT_FAILURE);
     }
 
     // make socket reusable. After `close(sock)` there is a timeout (due to OS)
     // when address becomes available to bind again. Thus, make it reusable to
     // not get "Address already in use" error.
-    int enable = 1;
     // https://hea-www.harvard.edu/~fine/Tech/addrinuse.html
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0){
+    int enable = 1;
+    rc = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
+    if (rc < 0){
         perror("setsockopt(SO_REUSEADDR) failed");
-        safe_leave(sock, &_params->mutex);
+        safe_leave(sock, mutex, params.ind);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -886,13 +1020,13 @@ void *wrap_try_get_rpc(void *arg){
     rc = fcntl(sock, F_SETFL, O_NONBLOCK);
     if (rc < 0){
         perror("Error in fcntl");
-        safe_leave(sock, &_params->mutex);
+        safe_leave(sock, mutex, params.ind);
         return ((void *)EXIT_FAILURE);
     }
     rc = bind(sock, (struct sockaddr *)&local, sizeof(local));
     if (rc < 0) {
         perror("ошибка вызова bind in wrap!");
-        safe_leave(sock, &_params->mutex);
+        safe_leave(sock, mutex, params.ind);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -900,21 +1034,14 @@ void *wrap_try_get_rpc(void *arg){
     rc = listen(sock, MAX_CLIENTS);
     if (rc) {
         perror("ошибка вызова listen");
-        safe_leave(sock, &_params->mutex);
+        safe_leave(sock, mutex, params.ind);
         return ((void *)EXIT_FAILURE);
     }
 
-    params.sock = sock;
-    try_get_rpc(&params);
-    safe_leave(sock, &_params->mutex);
+    _params->sock = sock;
+    try_get_rpc(_params);
+    safe_leave(sock, mutex, params.ind);
     return ((void *)EXIT_SUCCESS);
-}
-
-void mysleep(int ms){
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000;
-    nanosleep(&ts, NULL);
 }
 
 void apply(entry_t entry){
@@ -937,7 +1064,7 @@ void *respond_to_client(void *arg){
         int sock;
         if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
             perror("ошибка вызова socket");
-            safe_leave(sock, NULL);
+            safe_leave(sock, NULL, -1);
             return ((void *)EXIT_FAILURE);
         }
 
@@ -945,7 +1072,7 @@ void *respond_to_client(void *arg){
         int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
         if (rc != 0) {
             perror("ошибка вызова connect");
-            safe_leave(sock, NULL);
+            safe_leave(sock, NULL, -1);
             return ((void *)EXIT_FAILURE);        
         }
         printf("Connected %d %d\n", SERVER_ID, port);
@@ -958,11 +1085,11 @@ void *respond_to_client(void *arg){
         rc = send(sock, &entry_received, sizeof(entry_received), 0);
         if (rc <= 0) {
             perror("ошибка вызова send");
-            safe_leave(sock, NULL);
+            safe_leave(sock, NULL, -1);
             return ((void *)EXIT_FAILURE);
         }
 
-        safe_leave(sock, NULL);
+        safe_leave(sock, NULL, -1);
         printf("Entry with index %d is sent to client\n", entry.index);
         return ((void *)EXIT_SUCCESS);
     }
@@ -981,6 +1108,7 @@ int run_server(config_t *config) {
     printf("Running %d\n", config->port);
 
     last_heartbeat = clock();
+    time(&last_heartbeat_time);
     try_get_rpc_t params;
     memset(&params, 0, sizeof(params));
 
@@ -989,103 +1117,144 @@ int run_server(config_t *config) {
     pthread_mutex_init(&params.vote_mutex, NULL);
     pthread_mutex_init(&client_mutex, NULL);
 
-    for (current_term;current_term < 15;) {
+    int j = 0;
+    time_t run_start = time(NULL);
+
+    for (current_term;current_term < 15 && time_spent_time(run_start) < 120;) {
+        printf("--------------------------------------------------\n");
         printf("Current term %d\n", current_term);
 
-        while (commit_index > last_applied){
-            last_applied++;
-            apply(log_arr.entries[last_applied]);
-        }
+        time_t term_start;
+        time(&term_start);
 
-        int i = 0;
-        int rc;
-        pthread_t thread;
+        while(time_spent_time(term_start) < TERM_TIMEOUT){
+            j++;
+            printf("------------------------------\n");
+            printf("New round in term %d\n", current_term);
+            timestamp();
+            while (commit_index > last_applied){
+                last_applied++;
+                apply(log_arr.entries[last_applied]);
+            }
 
-        switch (State){
-            case Follower:;
-                printf("I'm Follower\n");
-                timestamp();
-                // become_follower(leader_id);
-                params.follower = 1;
-                printf("Waiting for incoming messages\n");
-                wrap_try_get_rpc(&params);
-                break;
-            case Candidate:;
-                // create thread to get possible append_entries rpc 
-                params.config = config;
-                params.follower = 0;
-                pthread_create(&thread, NULL, wrap_try_get_rpc, &params);
-                int sleep_time = (int)rand_in_range(0.0, CANDIDATE_TIMEOUT);
-                printf("I'm Candidate, sleeping %d\n", sleep_time);
-                timestamp();
-                mysleep(sleep_time);
+            int i = 0;
+            int rc;
+            pthread_t thread;
+            params.ind = j;
 
-                // election, trying to get votes.
-                // in case we got rpc to become follower
-                // in try_get_rpc thread stop requesting
-                send_request_vote_rpc_to_all();
-                
-                // first outcome in perfect situation 
-                // (no other server is claimed as leader)
-                if (votes > NUMBER_OF_PORTS / 2 && State == Candidate){
-                    become_leader();
-                }
+            switch (State){
+                case Follower:;
+                    printf("I'm Follower\n");
+                    timestamp();
+                    printf("Waiting for incoming messages\n");
+                    wrap_try_get_rpc(&params);
+                    break;
+                case Candidate:;
+                    // create thread to get possible append_entries rpc 
+                    params.config = config;
+                    params.follower = 0;
+                    pthread_create(&thread, NULL, wrap_try_get_rpc, &params);
+                    int sleep_time = (int)rand_in_range(0.0, CANDIDATE_TIMEOUT);
+                    printf("I'm Candidate, sleeping %d\n", sleep_time);
+                    mysleep(sleep_time);
+                    timestamp();
 
-                // pthread_kill will free mutex
-                pthread_mutex_lock(&params.vote_mutex);
-                rc = pthread_kill(thread, NULL);
-                if (rc != 0){
-                    perror("Error in pthread_kill");
-                }
-                pthread_mutex_unlock(&params.vote_mutex);
-                break;
-            case Leader:;
-                printf("I'm Leader <<<<<<<<<<<<<<<\n");
-                timestamp();
-                update_client(&client_mutex);
-
-                // leader actions
-                int heartbeat = 0;
-                send_append_entries_rpc_to_all();
-                flsh();
-                
-                // simulate incoming message from client (append entry by now)
-                entry_t entry = make_entry(gen_command(), current_term, log_arr.last);
-                push_back(&log_arr, entry);
-                printf("===========\n");
-                printf("Generated entry\n");
-                print_entry(entry);
-                printf("===========\n");
-                
-                // used for testing
-                                
-                // If there exists an N such that N > commitIndex, a majority
-                // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
-                // set commitIndex = N (§5.3, §5.4).
-
-                int new_ci = commit_index;
-                for(new_ci; new_ci <= last_log_index; new_ci++){
-                    int j;
-                    int cnt = 0;
-                    for (j = 0; j < NUMBER_OF_PORTS; j++){
-                        cnt += (match_index[j] >= new_ci); // && log_arr.entries[new_ci].term == current_term);  // TODO: do we need this condition?
+                    if (State != Candidate){
+                        break;
                     }
-                    if (cnt > NUMBER_OF_PORTS / 2){
-                        commit_index = new_ci;
-                        printf("Commit index is updated: %d\n", commit_index);
+
+                    // election, trying to get votes.
+                    // in case we got rpc to become follower
+                    // in try_get_rpc thread stop requesting
+                    send_request_vote_rpc_to_all();
+                    
+                    // first outcome in perfect situation 
+                    // (no other server is claimed as leader)
+                    if (votes > NUMBER_OF_PORTS / 2 && State == Candidate){
+                        become_leader();
                     }
-                }
 
-                printf("Leader sleeping\n");
-                sleep(5);
-                break;
-            default:
-                printf("Unknown state %d", State);
-                break;
+                    printf("Locks in Candidate\n");
+                    pthread_mutex_lock(&params.mutex);
+                    pthread_mutex_lock(&params.vote_mutex);
+                    printf("Canceling wrap try get rpc ----X\n");
+                    rc = pthread_cancel(thread);
+                    if (rc != 0){
+                        perror("Error in pthread_cancel");
+                    }
+                    pthread_mutex_unlock(&params.mutex);
+                    pthread_mutex_unlock(&params.vote_mutex);
+                    printf("Unlocks in Candidate\n");
+                    break;
+                case Leader:;
+                    printf("I'm Leader <<<<<<<<<<<<<<< LEADER\n");
+                    // create thread to get possible append_entries rpc 
+                    params.config = config;
+                    params.follower = 0;
+                    pthread_create(&thread, NULL, wrap_try_get_rpc, &params);
+
+                    timestamp();
+                    
+                    if (State != Leader){ break; }
+                    update_client(&client_mutex);
+                    
+                    // simulate incoming message from client (append entry by now)
+                    if (State != Leader){ break; }
+                    entry_t entry = make_entry(gen_command(), current_term, log_arr.last);
+                    push_back(&log_arr, entry);
+                    printf("===========\n");
+                    printf("Generated entry\n");
+                    print_entry(entry);
+                    printf("===========\n");
+                    
+                    // leader actions
+                    send_append_entries_rpc_to_all();
+                    flsh();
+                    
+                    // used for testing
+                                    
+                    // If there exists an N such that N > commitIndex, a majority
+                    // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+                    // set commitIndex = N (§5.3, §5.4).
+
+                    int new_ci;
+                    for(new_ci = commit_index + 1; new_ci <= last_log_index; new_ci++){
+                        int j;
+                        int cnt = 0;
+                        for (j = 0; j < NUMBER_OF_PORTS; j++){
+                            cnt += (match_index[j] >= new_ci); // && log_arr.entries[new_ci].term == current_term);  // TODO: do we need this condition?
+                        }
+                        if (cnt > NUMBER_OF_PORTS / 2){
+                            commit_index = new_ci;
+                            printf("Commit index is updated: %d\n", commit_index);
+                        }
+                    }
+
+                    if (State == Leader){
+                        printf("Leader sleeping\n");
+                        mysleep(5000);
+                    }
+                    printf("Locking mutex in leader\n");
+                    pthread_mutex_lock(&params.mutex);
+                    printf("Locking vote mutex in leader\n");
+                    pthread_mutex_lock(&params.vote_mutex);
+                    printf("vote mutex in leader is locked\n");
+
+                    rc = pthread_cancel(thread);
+                    if (rc != 0){
+                        perror("Error in pthread_cancel");
+                    }
+                    pthread_mutex_unlock(&params.mutex);
+                    pthread_mutex_unlock(&params.vote_mutex);
+                    printf("Unlocking mutexes in leader\n");
+                    break;
+                default:
+                    printf("Unknown state %d", State);
+                    break;
+            }
         }
-
         flsh();
-        current_term++;
+        // current_term++;
     }
 
     print_log(log_arr);
