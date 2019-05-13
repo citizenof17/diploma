@@ -1,11 +1,12 @@
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <fcntl.h>
-#include <netinet/in.h>
 #include <unistd.h>
 #include <inttypes.h>
 #include <unistd.h>
@@ -19,7 +20,7 @@
 
 #define DEFAULT_PORT (7500)
 #define CLIENT_PORT (8000)
-#define DEFAULT_LOG_SIZE (100)
+#define DEFAULT_LOG_SIZE (3)
 #define BAD_PORT (1)
 #define MAX_PORT (65535)
 #define IP_ADDR ("127.0.0.1")
@@ -611,9 +612,9 @@ void *handle_request_vote_rpc(int sock){
 void *handle_append_entries_rpc(int sock){
     printf("Handling append entries rpc\n");
     int rc;
-    int keep_connection = 1;
+    int keep_conn = 1;
 
-    while (keep_connection){
+    while (keep_conn){
         ae_rpc_message_t message;
         rc = recv(sock, &message, sizeof(message), 0);
         if (rc <= 0) {
@@ -622,6 +623,8 @@ void *handle_append_entries_rpc(int sock){
             // safe_leave(sock, NULL);
             return ((void *)EXIT_FAILURE);
         }
+
+        keep_conn = message.keep_connection;
 
         ae_rpc_response_t response = {
             .term = current_term,
@@ -633,6 +636,7 @@ void *handle_append_entries_rpc(int sock){
         if (message.term < current_term){
             // Reply false if term < currentTerm
             printf("handle_append_entries_rpc: message.term %d < current_term %d\n", message.term, current_term);
+            keep_conn = 0;
         }
         else if (log_arr.last <= message.prev_log_index || (log_arr.last > message.prev_log_index &&
                 log_arr.entries[message.prev_log_index].term != message.prev_log_term)){
@@ -662,14 +666,18 @@ void *handle_append_entries_rpc(int sock){
                 print_entry(message.entries);
                 printf("==========\n");
 
-                response.success = 1;
             }
             else{
                 //this is hearbeat
                 printf("==========\n");
                 printf("Heartbeat\n");
                 printf("==========\n");
+                // if it was successful  heartbeat, we should stop receiving messages
+                keep_conn = 0;
             }
+
+            response.success = 1;
+
             // 5. If leaderCommit > commitIndex, set commitIndex =
             // min(leaderCommit, index of last new entry)
             if (message.leader_commit > commit_index){
@@ -686,7 +694,7 @@ void *handle_append_entries_rpc(int sock){
             // safe_leave(sock, NULL);
             return ((void *)EXIT_FAILURE);
         }
-        keep_connection = message.keep_connection;
+        printf("Keep connection: %d\n", keep_conn);
     }
 
     return ((void *) EXIT_SUCCESS);
@@ -849,15 +857,18 @@ void *send_append_entries_rpc(void *arg){
         return ((void *)EXIT_FAILURE);
     }
 
-    for (i = 0; i <= 0/*max(last_log_index - next_index[follower_id], 1)*/; i++){
-        printf("%d round of append entries to %d\n", i, follower_id);
+    // send atleast once for heartbeat
+    keep_connection[follower_id] = 1;
+    while(keep_connection[follower_id]){
+        printf("New round of append entries to %d\n", follower_id);
         int prev_log_index = next_index[follower_id] - 1;
 
-        // this might happen whenn all entries are sent, but we still want to heartbeat
+        // this might happen when all entries are sent, but we still want to heartbeat
         if (next_index[follower_id] >= log_arr.size){
             increase_log_size(&log_arr);
         }
 
+        keep_connection[follower_id] &= State == Leader;
         ae_rpc_message_t message = {
             .term = current_term,
             .leader_id = SERVER_ID,
@@ -868,7 +879,7 @@ void *send_append_entries_rpc(void *arg){
             .keep_connection = keep_connection[follower_id],     
         };
 
-        if (next_index[follower_id] > last_log_index){  //heartbeat
+        if (next_index[follower_id] > last_log_index || (State != Leader)){  //heartbeat
             message.entries.index = -1;
             hearbeat = 1;
         }
@@ -889,21 +900,29 @@ void *send_append_entries_rpc(void *arg){
             return ((void *)EXIT_FAILURE);
         }
 
+        printf("Received in send ae success: %d  term: %d\n", response.success, response.term);
         if (!update_self_to_follower(response.term, -1)){
             if (response.success) {
-                if (!hearbeat){
-                    match_index[follower_id] = next_index[follower_id];
-                    next_index[follower_id]++;
+                if (hearbeat){
+                    // message is successful and it was a heartbeat, means
+                    // that last log entries match, stop sending messages
+                    // same should be verified on the other side
+                    keep_connection[follower_id] = 0;
+                    printf("Sent heartbeat \n");
                 }
                 else{
-                    keep_connection[follower_id] = 0;
+                    match_index[follower_id] = next_index[follower_id];
+                    next_index[follower_id]++;
                 }
             }
             else {
                 next_index[follower_id] = max(next_index[follower_id] - 1, 1);
+                keep_connection[follower_id] = 1;
             }
         }
-        printf("Received %d\n", response.success);
+        else {
+            break;
+        }
     }
 
     flsh();
@@ -1164,15 +1183,14 @@ int run_server(config_t *config) {
     for (current_term;current_term < 15 && time_spent_time(run_start) < 120;) {
         printf("--------------------------------------------------\n");
         printf("Current term %d\n", current_term);
-
         time_t term_start;
         time(&term_start);
 
         while(time_spent_time(term_start) < TERM_TIMEOUT){
             j++;
             printf("------------------------------\n");
-
             printf("New round in term %d\n", current_term);
+            printf("Commit index is: %d", commit_index);
             timestamp();
             while (commit_index > last_applied){
                 last_applied++;
@@ -1230,6 +1248,20 @@ int run_server(config_t *config) {
                     }
                     break;
                 case Leader:;
+
+                    int new_ci;
+                    for(new_ci = commit_index + 1; new_ci <= last_log_index; new_ci++){
+                        int j;
+                        int cnt = 0;
+                        for (j = 0; j < NUMBER_OF_PORTS; j++){
+                            cnt += (match_index[j] >= new_ci); // && log_arr.entries[new_ci].term == current_term);  // TODO: do we need this condition?
+                        }
+                        if (cnt > NUMBER_OF_PORTS / 2){
+                            commit_index = new_ci;
+                            printf("Commit index is updated: %d\n", commit_index);
+                        }
+                    }
+
                     printf("I'm Leader <<<<<<<<<<<<<<< LEADER\n");
                     // create thread to get possible append_entries rpc 
                     params.config = config;
@@ -1260,19 +1292,6 @@ int run_server(config_t *config) {
                     // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
                     // set commitIndex = N (§5.3, §5.4).
 
-                    int new_ci;
-                    for(new_ci = commit_index + 1; new_ci <= last_log_index; new_ci++){
-                        int j;
-                        int cnt = 0;
-                        for (j = 0; j < NUMBER_OF_PORTS; j++){
-                            cnt += (match_index[j] >= new_ci); // && log_arr.entries[new_ci].term == current_term);  // TODO: do we need this condition?
-                        }
-                        if (cnt > NUMBER_OF_PORTS / 2){
-                            commit_index = new_ci;
-                            printf("Commit index is updated: %d\n", commit_index);
-                        }
-                    }
-
                     if (State == Leader){
                         printf("Leader sleeping\n");
                         mysleep(2000);
@@ -1297,10 +1316,12 @@ int run_server(config_t *config) {
             }
         }
         flsh();
+        printf("Time spent %f\n", time_spent(run_start));
         // current_term++;
     }
 
     print_log(log_arr);
+    return (EXIT_SUCCESS);
 }
 
 int parse_str(int *num, char *str){
@@ -1326,6 +1347,7 @@ int parse_str(int *num, char *str){
 
 void intHandler(int smt){
     print_log(log_arr);
+    printf("Error code %d\n", smt);
     exit(1);
 }
 
@@ -1344,7 +1366,7 @@ int main(int argc, char * argv[]){
     log_arr.entries = (entry_t *)malloc(sizeof(entry_t) * DEFAULT_LOG_SIZE);
 
     int rc = run_server(&config);
-    if (rc != 0){
+    if (rc != (EXIT_SUCCESS)){
         printf("Fail?\n");
     }
 

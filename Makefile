@@ -23,20 +23,21 @@
 # clear:
 # 	${RM} *.o
 #
+# client: client.o
+	# gcc -o client client.o -lpthread
+# client.o: client.c
 
 STD=-std=c11
 
-all: server clear
+all: server test clear
 
 server: server.o
 	gcc ${STD} -g -o server server.o -lpthread
-# client: client.o
-	# gcc -o client client.o -lpthread
+
 test: test.o
-	gcc -o test test.o -lpthread
+	gcc ${STD} -o test test.o -lpthread
 
 server.o: server.c
-# client.o: client.c
 test.o: test.c
 
 clear:
