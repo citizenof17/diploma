@@ -25,7 +25,7 @@
 #define MAX_PORT (65535)
 #define IP_ADDR ("127.0.0.1")
 #define MAX_CLIENTS (5)
-#define NUMBER_OF_PORTS (2)
+#define NUMBER_OF_PORTS (3)
 #define TERM_TIMEOUT (15) //in seconds
 #define APPEND_ENTRIES_TIMEOUT (3000) // in milliseconds
 #define SELECT_TIMEOUT (10)    // in seconds
@@ -171,7 +171,8 @@ typedef struct message_t {
 } message_t;
 
 typedef struct mutex_id_t {
-    pthread_mutex_t mutex;
+    pthread_mutex_t *mutex;
+    pthread_mutex_t *mtx;
     int id;
 } mutex_id_t;
 
@@ -228,7 +229,7 @@ whom_e State = Follower;
 
 // int SERVER_ID = SERVER_ID;
 int SERVER_ID;
-int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501};
+int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501, 7502};
 int leader = 0;
 deque_t client_requests;  // needed to store all unresponded commands from client
                           // it's stored until not commited, after commit - send
@@ -241,6 +242,7 @@ int last_log_index = 0; // this sohuld be equal to log_arr.last - 1
 int last_log_term = 0;  // term of last entry in log
 
 int current_term = 1;
+int voted_term = 0;
 int voted_for = 0;
 log_arr_t log_arr;
 int votes = 0;
@@ -248,8 +250,8 @@ int votes = 0;
 int commit_index = 0;
 int last_applied = 0;
 
-int next_index[NUMBER_OF_PORTS] = {1, 1};
-int match_index[NUMBER_OF_PORTS] = {0, 0};
+int next_index[NUMBER_OF_PORTS] = {1, 1, 1};
+int match_index[NUMBER_OF_PORTS] = {0, 0, 0};
 
 // auxiliary, = 1 if we should send more append entries to server
 int keep_connection[NUMBER_OF_PORTS] = {1, 1};
@@ -279,15 +281,14 @@ void increase_log_size(log_arr_t *logg){
     logg->size *= 2;
 }
 
-void become_follower(int new_leader_id, clock_t timer, char *buf){
+void become_follower(int new_leader_id, char *buf){
     printf("Become follower in %s\n", buf);
 
-    if (timer != -1){
-        last_heartbeat = timer;
-        time(&last_heartbeat_time);
-    }
+    time(&last_heartbeat_time);
     State = Follower;
-    voted_for = 0;
+    if (voted_term != current_term){
+        voted_for = 0;
+    }
     votes = 0;
     if (new_leader_id != -1){
         leader_id = new_leader_id;
@@ -299,7 +300,7 @@ void become_follower(int new_leader_id, clock_t timer, char *buf){
 int update_self_to_follower(int new_term, int new_leader_id){
     if (new_term > current_term){
         printf("Updating self to follower, new_term: %d, old term %d; ", new_term, current_term);
-        become_follower(new_leader_id, clock(), "update self to follower");
+        become_follower(new_leader_id, "update self to follower");
         current_term = new_term;
         return 1; //updated
     }
@@ -417,11 +418,12 @@ void become_leader(){
     }
 }
 
-void initiate_election(){
+void initiate_election(){ //become_candidate
     printf("Initiate election\n");
     current_term++;
     State = Candidate;
     voted_for = SERVER_ID;
+    voted_term = current_term;
     votes = 1;
     //reset election timer? 
 }
@@ -581,6 +583,7 @@ void *handle_request_vote_rpc(int sock){
     rv_rpc_response_t response;
     response.term = current_term;
     response.vote_granted = 0;
+    current_term = max(current_term, message.term);    
 
     if (message.term < current_term){
         //1. Reply false if term < currentTerm (§5.1)
@@ -588,17 +591,19 @@ void *handle_request_vote_rpc(int sock){
     else {
         // 2. If votedFor is null or candidateId, and candidate’s log is at
         // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-        if ((!voted_for || voted_for == message.candidate_id) && 
+        if ((!voted_for || voted_for == message.candidate_id || 
+        voted_term != current_term) && 
         message.last_log_index >= last_log_index && 
         message.last_log_term >= last_log_term){
             response.vote_granted = 1;
-            become_follower(-1, clock(), "handle_request_vote_rpc");
+            voted_for = message.candidate_id;
+            voted_term = current_term;
+            become_follower(-1, "handle_request_vote_rpc");
         }
     }
     
     printf("Sending data to Candidate with term %d, my term %d, vote_granted: %d\n",
      message.term, current_term, response.vote_granted);
-    current_term = max(current_term, message.term);    
     rc = send(sock, &response, sizeof(response), 0);
     if (rc <= 0){
         perror("Error in handle_request_vote_rpc send");
@@ -650,12 +655,14 @@ void *handle_append_entries_rpc(int sock){
 
             if (entry_index != -1) { // lets differentiate heartbeats by this
                 // this is real entry 
-                if (entry_index >= log_arr.size){
+                while (entry_index >= log_arr.size){
                     increase_log_size(&log_arr);
                 }
-                if (!eq_entries(log_arr.entries[entry_index], message.entries)){
-                    memset(&log_arr.entries[entry_index], 0,
-                    (log_arr.last - entry_index + 1) * sizeof(entry_t));
+                if (log_arr.last > entry_index && 
+                !eq_entries(log_arr.entries[entry_index], message.entries)){
+                    printf("MEMSETTING ENTRIES\n");
+                    memset(&(log_arr.entries[entry_index]), 0,
+                    (log_arr.last - entry_index) * sizeof(entry_t));
                     log_arr.last = entry_index;
                 }
                 
@@ -683,7 +690,7 @@ void *handle_append_entries_rpc(int sock){
             if (message.leader_commit > commit_index){
                 commit_index = min(message.leader_commit, last_log_index);
             }
-            become_follower(message.leader_id, clock(), "handle_append_entries_rpc");
+            become_follower(message.leader_id, "handle_append_entries_rpc");
         }
 
         printf("Handling in append_entries_rpc is done, return\n");
@@ -787,7 +794,8 @@ void *handle_rpc(int fd) {
         return ((void *)EXIT_FAILURE);
     }
 
-    printf("Received prep message from %d\n", message.from);
+    printf("Received prep message from %d, whom %d, type %d, term %d\n",
+     message.from, message.whom, message.type, message.term);
     // Differentiate between clients and leader/other servers
     switch (message.whom){
         case Client:;
@@ -817,7 +825,9 @@ void *handle_rpc(int fd) {
 void *send_append_entries_rpc(void *arg){
     mutex_id_t *_mutex_id = (mutex_id_t *)arg;
     int follower_id = _mutex_id->id;
-    pthread_mutex_t *mutex = &_mutex_id->mutex;
+    pthread_mutex_t *mutex = _mutex_id->mutex;
+    pthread_mutex_unlock(_mutex_id->mtx);
+
     printf("Send append entries to %d\n", follower_id);
     int port = KNOWN_PORTS[follower_id];
 
@@ -931,19 +941,27 @@ void *send_append_entries_rpc(void *arg){
 }
 
 void *send_append_entries_rpc_to_all(){
-    // should be parallel
     int i;
+    int rc;
     pthread_t threads[NUMBER_OF_PORTS];
     pthread_mutex_t mutexes[NUMBER_OF_PORTS];
+    pthread_mutex_t mtx;
+    pthread_mutex_init(&mtx, NULL);
+    pthread_mutex_lock(&mtx);
 
     for (i = 0; i < NUMBER_OF_PORTS; i++){
         if (i == SERVER_ID){ continue; }
-        pthread_mutex_init(&mutexes[i], NULL);
         mutex_id_t mutex_id = {
-            .mutex = mutexes[i],
+            .mutex = &mutexes[i],
+            .mtx = &mtx,
             .id = i,
         };
-        pthread_create(&threads[i], NULL, send_append_entries_rpc, &mutex_id);
+        printf("Creating thread send_append_entries_rpc for server %d\n", i);
+        rc = pthread_create(&threads[i], NULL, send_append_entries_rpc, &mutex_id);
+        if (rc != 0){
+            perror("Error in creating thread in send_append_entries_rpc_to_all");
+        }
+        pthread_mutex_lock(&mtx);
     }
     for (i = 0; i < NUMBER_OF_PORTS; i++){
         if (i == SERVER_ID){ continue; }
@@ -1190,7 +1208,7 @@ int run_server(config_t *config) {
             j++;
             printf("------------------------------\n");
             printf("New round in term %d\n", current_term);
-            printf("Commit index is: %d", commit_index);
+            printf("Commit index is: %d\n", commit_index);
             timestamp();
             while (commit_index > last_applied){
                 last_applied++;
@@ -1316,7 +1334,7 @@ int run_server(config_t *config) {
             }
         }
         flsh();
-        printf("Time spent %f\n", time_spent(run_start));
+        printf("Time spent %f\n", time_spent_time(run_start));
         // current_term++;
     }
 

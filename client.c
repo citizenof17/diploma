@@ -10,8 +10,9 @@
 #include <ctype.h>
 
 #define IP_ADDR ("127.0.0.1")
-
-int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501, 7502};
+#define CLIENT_PORT (5700);
+#define NUMBER_OF_PORTS = 3;
+int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501};
 
 typedef struct client_params_t {
     // struct sockaddr_in *peer;
@@ -33,12 +34,14 @@ void * run_client(void * arg){
     int rc;
     char buf[1];
     
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
         perror("ошибка вызова socket");
         return ((void *)EXIT_FAILURE);
     }
-    
-    if ((rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer))) > 0) {
+
+    rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer));
+    if (rc > 0) {
         perror("ошибка вызова connect");
         return ((void *)EXIT_FAILURE);        
     }
