@@ -1,31 +1,20 @@
 #define _GNU_SOURCE
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/select.h>
 #include <sys/time.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <inttypes.h>
 #include <unistd.h>
-#include <pthread.h>
-#include <string.h>
-#include <ctype.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <signal.h>
+#include "protocol.h"
+#include "rb_tree.h"
+#include "map_interface.h"
+#include "tree_hash_map.h"
 
 #define DEFAULT_PORT (7500)
-#define CLIENT_PORT (8000)
 #define DEFAULT_LOG_SIZE (3)
 #define BAD_PORT (1)
 #define MAX_PORT (65535)
 #define IP_ADDR ("127.0.0.1")
 #define MAX_CLIENTS (5)
-#define NUMBER_OF_PORTS (3)
 #define TERM_TIMEOUT (15) //in seconds
 #define APPEND_ENTRIES_TIMEOUT (3000) // in milliseconds
 #define SELECT_TIMEOUT (10)    // in seconds
@@ -36,27 +25,15 @@
 #define min(x, y) (((x) < (y)) ? (x) : (y))
 #define max(x, y) (((x) > (y)) ? (x) : (y))
 
+map_t map;
+
 // rv = retval = return value
 // rc = return code
 
 // TODO: improve leader election efficiency
-
-typedef enum whom_e {
-    Unknown,
-    Client,
-    Follower,
-    Candidate,
-    Leader,
-} whom_e;
-
-typedef enum type_e {
-    RequestVote,
-    AppendEntries,
-    HeartBeat,
-    Operation,
-} type_e;
-
 // initially all servers start in follower state
+
+int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501, 7502};
 
 struct timespec select_timeout = {
     .tv_sec = SELECT_TIMEOUT,
@@ -72,45 +49,6 @@ struct timeval recv_timeout = {
     .tv_sec = RECV_TIMEOUT,
     .tv_usec = 0,
 };
-
-typedef struct command_t {
-    int val;
-    // TODO: extend command
-} command_t;
-
-typedef struct prepare_message_t {
-    type_e type;
-    whom_e whom;
-    int from;
-    int term;
-} prepare_message_t;
-
-typedef struct prepare_message_response_t {
-    int ready;
-    int term;
-} prepare_message_response_t;
-
-typedef struct prepare_message_client_t {
-    int ready;
-    int leader_id;
-} prepare_message_client_t;
-
-typedef struct entry_t {
-    int term;
-    int index;
-    command_t command;
-} entry_t;
-
-typedef struct log_arr_t {
-    int size;
-    int last; // position to write, inclusive, starting from 1
-    entry_t *entries;
-} log_arr_t;
-
-typedef struct response_t {
-    int val;
-    int term;
-} response_t;
 
 typedef struct ae_rpc_message_t {
     int term;
@@ -157,30 +95,13 @@ typedef struct server_params_t {
     config_t *config;
     int fd;
     pthread_mutex_t mutex;
- } server_params_t;
-
-typedef struct message_t {
-    type_e type;
-    whom_e whom;  // type of server (Candidate, Leader, Client etc)
-    int term;   
-    int from; // TODO: remove, change to candidate_id
-    int candidate_id;  // port of server
-    int last_log_index;
-    int last_log_term;
-    command_t command;
-} message_t;
+} server_params_t;
 
 typedef struct mutex_id_t {
     pthread_mutex_t *mutex;
     pthread_mutex_t *mtx;
     int id;
 } mutex_id_t;
-
-typedef struct entry_received_t {
-    int term;
-    int index;
-    int commited;
-} entry_received_t;
 
 struct deque_entry_t;
 
@@ -229,11 +150,10 @@ whom_e State = Follower;
 
 // int SERVER_ID = SERVER_ID;
 int SERVER_ID;
-int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501, 7502};
 int leader = 0;
 deque_t client_requests;  // needed to store all unresponded commands from client
-                          // it's stored until not commited, after commit - send
-                          // client a notification that this entry is commited
+                          // it's stored until not committed, after commit - send
+                          // client a notification that this entry is committed
                           // but this doubles memory used for entries
 int leader_id;
 
@@ -244,7 +164,7 @@ int last_log_term = 0;  // term of last entry in log
 int current_term = 1;
 int voted_term = 0;
 int voted_for = 0;
-log_arr_t log_arr;
+// log_arr_t log_arr;
 int votes = 0;
 
 int commit_index = 0;
@@ -259,12 +179,14 @@ int keep_connection[NUMBER_OF_PORTS] = {1, 1};
 clock_t last_heartbeat;
 time_t last_heartbeat_time;
 
-command_t gen_command(){
-    command_t command = {
-        .val = rand(),
-    };
-    return command;
-}
+
+// command_t gen_command(){
+//     command_t command = {
+//         .operatin = rand()
+//         .val = rand(),
+//     };
+//     return command;
+// }
 
 entry_t make_entry(command_t command, int term, int index){
     entry_t entry = {
@@ -317,33 +239,6 @@ void push_back(log_arr_t *logg, entry_t entry){
     match_index[SERVER_ID] = last_log_index;
 }
 
-void print_command(command_t command){
-    printf("Val: %d\n", command.val);
-}
-
-void print_entry(entry_t entry){
-    printf("Term %d, Index %d ", entry.term, entry.index);
-    print_command(entry.command);
-}
-
-void print_log(log_arr_t logg){
-    int i;
-    printf("===================\n");
-    printf("|| Printing log   ||\n");
-    printf("===================\n");
-    printf("Commitindex: %d\n\n", commit_index);
-    printf("Log size: %d, log last %d\n", logg.size, logg.last);
-    printf("\n");
-    for (i = 0; i < logg.last; i++){
-        printf("Index %d: \n", i);
-        print_entry(logg.entries[i]);
-    }
-
-    printf("===================\n");
-    printf("|| Log is printed ||\n");
-    printf("===================\n");
-}
-
 float rand_in_range(float a, float b){
     return a + (float)(rand())/(float)(RAND_MAX) * (b - a);
 }
@@ -376,7 +271,9 @@ double time_spent_time(time_t start_time){
 }
 
 int eq_command(const command_t a, const command_t b){
-    return a.val == b.val;
+    return a.operation == b.operation &&
+        strcmp(a.key, b.key) == 0 &&
+        strcmp(a.value, b.value) == 0;
 }
 
 int eq_entries(const entry_t a, const entry_t b){
@@ -661,7 +558,7 @@ void *handle_append_entries_rpc(int sock){
                 if (log_arr.last > entry_index && 
                 !eq_entries(log_arr.entries[entry_index], message.entries)){
                     printf("MEMSETTING ENTRIES\n");
-                    memset(&(log_arr.entries[entry_index]), 0,
+                    memset(&log_arr.entries[entry_index], 0,
                     (log_arr.last - entry_index) * sizeof(entry_t));
                     log_arr.last = entry_index;
                 }
@@ -709,30 +606,7 @@ void *handle_append_entries_rpc(int sock){
 
 void *handle_client(int sock){
 
-    // MOCK. Not tested
-
     int rc;
-    prepare_message_client_t response = {
-        .ready = 0,
-        .leader_id = leader_id,
-    };
-
-    if (leader_id == SERVER_ID){
-        // we are leader, handle client
-        response.ready = 1;
-    }
-    rc = send(sock, &response, sizeof(response), 0);
-    if (rc <= 0){
-        perror("Error in send in handle_client");
-        return ((void *)EXIT_FAILURE);
-    }
-
-    if (leader_id != SERVER_ID){
-        return ((void *)EXIT_SUCCESS);
-    }
-
-    // we are leadet and can recieve command from client
-
     command_t command;
     rc = recv(sock, &command, sizeof(command), 0);
     if (rc <= 0){
@@ -748,10 +622,13 @@ void *handle_client(int sock){
     printf("===========\n");
     deque_add(&client_requests, entry);
 
+    // here we notify client that we got his intent and placed it in a log,
+    // after that he will be waiting for some (long) time to receive approve,
+    // that this intent is committed, only then he will initiate new messages
+
     entry_received_t entry_received = {
         .term = entry.term,
         .index = entry.index,
-        .commited = 0,
     };
     rc = send(sock, &entry_received, sizeof(entry_received), 0);
     if (rc <= 0){
@@ -770,54 +647,74 @@ void *handle_rpc(int fd) {
         printf("Failed\n");
         return ((void *)EXIT_FAILURE);
     }
+    
+    if (message.whom == Client){
+        // if we got message right away to the leader, then we will start 
+        // communicating with client immediately
+        // other wise we will send him real leader id (if this server knows it, 
+        // -1 other wise)
+        // and real leader will get prepare message again
+        prepare_message_client_t response = {
+            .ready = (State == Leader),
+            .leader_id = leader_id,
+        };
 
-    update_self_to_follower(message.term, -1);
-
-    prepare_message_response_t response = {
-        .ready = 1,
-        .term = current_term,
-    };
-
-    if (message.term < current_term){
-        response.ready = 0;
         rc = send(fd, &response, sizeof(response), 0);
         if (rc <= 0){
             perror("Ошибка вызова send в handle rpc (prep mess)");
             return ((void *)EXIT_FAILURE);
         }
-        return ((void *) EXIT_SUCCESS);
-    }
-
-    rc = send(fd, &response, sizeof(response), 0);
-    if (rc <= 0){
-        perror("Ошибка вызова send в handle rpc (prep mess)");
-        return ((void *)EXIT_FAILURE);
-    }
-
-    printf("Received prep message from %d, whom %d, type %d, term %d\n",
-     message.from, message.whom, message.type, message.term);
-    // Differentiate between clients and leader/other servers
-    switch (message.whom){
-        case Client:;
+        if (State == Leader){
             handle_client(fd);
-            break;
-        case Follower:;  // Follower can only redirect clients (?)
-            printf("Got message from follower!!!\n");  // Follower shouldn't initiate any rpc
+        }
+    }
+    else{
+        printf("Received prep message from %d, whom %d, type %d, term %d\n",
+        message.from, message.whom, message.type, message.term);
+
+        update_self_to_follower(message.term, -1);
+
+        prepare_message_response_t response = {
+            .ready = 1,
+            .term = current_term,
+        };
+
+        if (message.term < current_term){
+            response.ready = 0;
+            rc = send(fd, &response, sizeof(response), 0);
+            if (rc <= 0){
+                perror("Ошибка вызова send в handle rpc (prep mess)");
+                return ((void *)EXIT_FAILURE);
+            }
+            return ((void *) EXIT_SUCCESS);
+        }
+
+        if (message.whom == Follower){
+            // Follower can only redirect clients (?)
+            // Follower shouldn't initiate any rpc
             // this might happen due to race condidtion:
             // e.g. Candidate starts try_get_rpc, 
             // get message with higher term -> set himself to follower
             // after that start sending request_vote_rpc.
             response.ready = 0;
-            send(fd, &response, sizeof(response), 0);
-            break;
-        case Candidate:;  // Candidate can only send RequestVote (?)
+            perror("Got message from follower!!!");
+        }
+        rc = send(fd, &response, sizeof(response), 0);
+        if (rc <= 0){
+            perror("Ошибка вызова send в handle rpc (prep mess)");
+            return ((void *)EXIT_FAILURE);
+        }
+
+        // Differentiate between clients and leader/other servers
+        if (message.whom == Candidate){  // Candidate can only send RequestVote (?)
             handle_request_vote_rpc(fd);
-            break;
-        case Leader:;
+        }
+        else if (message.whom == Leader){
             handle_append_entries_rpc(fd);
-            break;
-        default:;
+        }
+        else{
             perror("Unknown peer");
+        }
     }
     return ((void *)EXIT_SUCCESS);
 }
@@ -1122,65 +1019,90 @@ void *wrap_try_get_rpc(void *arg){
     return ((void *)EXIT_SUCCESS);
 }
 
-void apply(entry_t entry){
-    // apply entry to state machine
+
+void *respond_to_client(entry_t entry){
+    // right now we can store no more than one command from client
+    int rc;
+    // while(client_requests.first != NULL && 
+    //  client_requests.first->entry.index <= commit_index){
+        // entry_t entry = client_requests.first->entry;
+
+    int port = CLIENT_PORT;
+    printf("Updating client with entry index %d\n", entry.index);
+    struct sockaddr_in peer;
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(port);
+    peer.sin_addr.s_addr = inet_addr(IP_ADDR);
+
+    int sock;
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("ошибка вызова socket");
+        safe_leave(sock, NULL, -1);
+        return ((void *)EXIT_FAILURE);
+    }
+
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+    int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
+    if (rc != 0) {
+        perror("ошибка вызова connect");
+        safe_leave(sock, NULL, -1);
+        return ((void *)EXIT_FAILURE);        
+    }
+    printf("Connected from %d to client port %d\n", SERVER_ID, port);
+    entry_committed_t entry_committed = {
+        .index = entry.index,
+        .term = entry.term,
+        .committed = 1,
+        .response = entry.response,
+    };
+
+    rc = send(sock, &entry_committed, sizeof(entry_committed), 0);
+    if (rc <= 0) {
+        perror("ошибка вызова send");
+        safe_leave(sock, NULL, -1);
+        return ((void *)EXIT_FAILURE);
+    }
+
+    // deque_pop(&client_requests);
+    safe_leave(sock, NULL, -1);
+    printf("Entry with index %d is sent to client\n", entry.index);
+    // }
+    return ((void *)EXIT_SUCCESS);
 }
 
-void *respond_to_client(void *arg){
-    int rc;
-    while(client_requests.first != NULL && 
-     client_requests.first->entry.index <= commit_index){
-        entry_t entry = client_requests.first->entry;
+void apply(entry_t entry){
+    // apply entry to state machine
 
-        int port = CLIENT_PORT;
-        printf("Updating client with index %d\n", entry.index);
-        struct sockaddr_in peer;
-        peer.sin_family = AF_INET;
-        peer.sin_port = htons(port);
-        peer.sin_addr.s_addr = inet_addr(IP_ADDR);
+    command_t query = entry.command;
+    response_t response;
+    printf("operation: %d, key: %s, value: %s\n", query.operation, query.key, query.value);
+    switch (query.operation) {
+        case OP_ERASE:
+            entry.response = map.rem(map, query.key);
+            break;
+        case OP_SET:
+            entry.response = map.set(map, query.key, query.value);
+            break;
+        case OP_GET:
+            entry.response = map.get(map, query.key);
+            break;
+    }
 
-        int sock;
-        if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-            perror("ошибка вызова socket");
-            safe_leave(sock, NULL, -1);
-            return ((void *)EXIT_FAILURE);
-        }
-
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-        int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
-        if (rc != 0) {
-            perror("ошибка вызова connect");
-            safe_leave(sock, NULL, -1);
-            return ((void *)EXIT_FAILURE);        
-        }
-        printf("Connected %d %d\n", SERVER_ID, port);
-        entry_received_t entry_received = {
-            .index = entry.index,
-            .term = entry.term,
-            .commited = 1,
-        };
-
-        rc = send(sock, &entry_received, sizeof(entry_received), 0);
-        if (rc <= 0) {
-            perror("ошибка вызова send");
-            safe_leave(sock, NULL, -1);
-            return ((void *)EXIT_FAILURE);
-        }
-
-        safe_leave(sock, NULL, -1);
-        printf("Entry with index %d is sent to client\n", entry.index);
-        return ((void *)EXIT_SUCCESS);
+    // send response
+    if (State == Leader){
+        respond_to_client(entry);
     }
 }
 
-void *update_client(pthread_mutex_t *client_mutex){
-    printf("Update client\n");
-
-    pthread_t thread;
-    pthread_mutex_lock(client_mutex);
-    pthread_create(&thread, NULL, respond_to_client, NULL);
-    pthread_mutex_unlock(client_mutex);
-}
+// void *update_client(pthread_mutex_t *client_mutex){
+    // printf("Update client\n");
+    // respond_to_client();
+    // pthread_t thread;
+    // pthread_mutex_lock(client_mutex);
+    // pthread_create(&thread, NULL, respond_to_client, NULL);
+    // pthread_mutex_unlock(client_mutex);
+// }
 
 int run_server(config_t *config) {
     printf("Running %d\n", config->port);
@@ -1365,14 +1287,16 @@ int parse_str(int *num, char *str){
 
 void intHandler(int smt){
     print_log(log_arr);
+    tree_hash_map_print(&map);
     printf("Error code %d\n", smt);
     exit(1);
 }
 
 int main(int argc, char * argv[]){
     srand(time(NULL));
-
     signal(SIGINT, intHandler);
+
+    tree_hash_map_init(&map, TREE_HASH_MAP_SIZE);
 
     parse_str(&SERVER_ID, argv[1]);
     config_t config = {
