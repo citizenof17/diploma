@@ -29,16 +29,27 @@
 
 STD=-std=c11
 
-all: server test clear
+all: server client clear
 
-server: server.o
-	gcc ${STD} -g -o server server.o -lpthread
+server: tree_hash_map.o rb_tree.o hash.o protocol.o server.o
+	gcc ${STD} -o server tree_hash_map.o rb_tree.o hash.o protocol.o server.o -lpthread
+
+client: protocol.o client.o
+	gcc ${STD} -o client client.o protocol.o -lpthread
+
+# client: client.o protocol.o
+# 	gcc ${STD} -o client client.o protocol.o -lpthread
 
 test: test.o
 	gcc ${STD} -o test test.o -lpthread
 
+protocol.o: protocol.c
 server.o: server.c
+client.o: client.c
 test.o: test.c
+tree_hash_map.o: tree_hash_map.c
+hash.o: hash.c
+rb_tree.o: rb_tree.c
 
 clear:
 	rm -v *.o

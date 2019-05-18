@@ -3,7 +3,6 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <inttypes.h>
-#include <unistd.h>
 #include "protocol.h"
 #include "rb_tree.h"
 #include "map_interface.h"
@@ -22,10 +21,12 @@
 #define ELECTION_TIMEOUT (5.0)  // in seconds
 #define CANDIDATE_TIMEOUT (5000) // in milliseconds
 #define RECV_TIMEOUT (2)         // in seconds
+#define TREE_HASH_MAP_SIZE (10)
 #define min(x, y) (((x) < (y)) ? (x) : (y))
 #define max(x, y) (((x) > (y)) ? (x) : (y))
 
 map_t map;
+log_arr_t log_arr;
 
 // rv = retval = return value
 // rc = return code
@@ -179,28 +180,14 @@ int keep_connection[NUMBER_OF_PORTS] = {1, 1};
 clock_t last_heartbeat;
 time_t last_heartbeat_time;
 
-
-// command_t gen_command(){
-//     command_t command = {
-//         .operatin = rand()
-//         .val = rand(),
-//     };
-//     return command;
-// }
-
-entry_t make_entry(command_t command, int term, int index){
-    entry_t entry = {
-        .term = term,
-        .index = index,
-        .command = command,
-    };
-    return entry;
-}
-
-void increase_log_size(log_arr_t *logg){
-    logg->entries = 
-        (entry_t *)realloc(logg->entries, 2 * logg->size * sizeof(entry_t));
-    logg->size *= 2;
+void push_back(log_arr_t *logg, entry_t entry){
+    if (logg->last == logg->size){
+        increase_log_size(logg);
+    }
+    logg->entries[logg->last++] = entry;
+    last_log_index = entry.index;
+    last_log_term = entry.term;
+    match_index[SERVER_ID] = last_log_index;
 }
 
 void become_follower(int new_leader_id, char *buf){
@@ -227,80 +214,6 @@ int update_self_to_follower(int new_term, int new_leader_id){
         return 1; //updated
     }
     return 0; //not updated
-}
-
-void push_back(log_arr_t *logg, entry_t entry){
-    if (logg->last == logg->size){
-        increase_log_size(logg);
-    }
-    logg->entries[logg->last++] = entry;
-    last_log_index = entry.index;
-    last_log_term = entry.term;
-    match_index[SERVER_ID] = last_log_index;
-}
-
-float rand_in_range(float a, float b){
-    return a + (float)(rand())/(float)(RAND_MAX) * (b - a);
-}
-
-void mysleep(int ms){
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000;
-    last_heartbeat -= (clock_t)((double)ms / 1000.0 * CLOCKS_PER_SEC);
-    nanosleep(&ts, NULL);
-}
-
-void flsh(){
-    fflush(stdout);
-    fflush(stderr);
-}
-
-void timestamp(){
-    printf("Timestamp: %d\n",(int)time(NULL));
-}
-
-// Do not rely on this function when using `sleep`
-double time_spent(clock_t start_time){
-    return (double)(clock() - start_time) / CLOCKS_PER_SEC;
-}
-
-/* return time spent in seconds */
-double time_spent_time(time_t start_time){  
-    return time(NULL) - start_time;
-}
-
-int eq_command(const command_t a, const command_t b){
-    return a.operation == b.operation &&
-        strcmp(a.key, b.key) == 0 &&
-        strcmp(a.value, b.value) == 0;
-}
-
-int eq_entries(const entry_t a, const entry_t b){
-    return eq_command(a.command, b.command) && 
-        a.index == b.index &&
-        a.term == b.index;
-}
-
-int safe_leave(int sock, pthread_mutex_t *mutex, int ind){
-    int rc;
-    rc = close(sock);
-    if (rc == -1){
-        perror("ERROR IN CLOSE");
-    }
-    if (mutex != NULL){
-        rc = pthread_mutex_unlock(mutex);
-        if (rc != 0){
-            perror("Error in unlock");
-            return (EXIT_FAILURE);
-        }
-        printf("Mutex is unlocked in safe_leave\n");
-        if (ind != -1){
-            printf("Leaving wrap_try_get_rpc -------------------^ %d\n", ind);
-        }
-    }
-    flsh();
-    return (EXIT_SUCCESS);
 }
 
 void become_leader(){
@@ -605,7 +518,6 @@ void *handle_append_entries_rpc(int sock){
 }
 
 void *handle_client(int sock){
-
     int rc;
     command_t command;
     rc = recv(sock, &command, sizeof(command), 0);
@@ -614,7 +526,7 @@ void *handle_client(int sock){
         return ((void *)EXIT_FAILURE);
     }
 
-    entry_t entry = make_entry(command, current_term, log_arr.last);
+    entry_t entry = make_entry(command, current_term, log_arr.last, SERVER_ID);
     push_back(&log_arr, entry);
     printf("===========\n");
     printf("Received entry from client\n");
@@ -649,6 +561,7 @@ void *handle_rpc(int fd) {
     }
     
     if (message.whom == Client){
+        printf("Got message from client\n");
         // if we got message right away to the leader, then we will start 
         // communicating with client immediately
         // other wise we will send him real leader id (if this server knows it, 
@@ -723,6 +636,7 @@ void *send_append_entries_rpc(void *arg){
     mutex_id_t *_mutex_id = (mutex_id_t *)arg;
     int follower_id = _mutex_id->id;
     pthread_mutex_t *mutex = _mutex_id->mutex;
+    printf("Unlock mtx in send_append_entries_rpc\n");
     pthread_mutex_unlock(_mutex_id->mtx);
 
     printf("Send append entries to %d\n", follower_id);
@@ -755,12 +669,13 @@ void *send_append_entries_rpc(void *arg){
         return ((void *)EXIT_FAILURE);
     }
 
-    pthread_mutex_lock(mutex);
+    // printf("Lock mutex in send_append_entries_rpc\n");
+    // pthread_mutex_lock(mutex);
     // send notificiation message about incoming append entries:
     rc = send_prep_message(sock, AppendEntries, State, SERVER_ID);
     if (rc != (EXIT_SUCCESS)){
         perror("Error in send prep message");
-        safe_leave(sock, mutex, -1);
+        safe_leave(sock, NULL, -1);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -771,7 +686,7 @@ void *send_append_entries_rpc(void *arg){
         int prev_log_index = next_index[follower_id] - 1;
 
         // this might happen when all entries are sent, but we still want to heartbeat
-        if (next_index[follower_id] >= log_arr.size){
+        while(next_index[follower_id] >= log_arr.size){
             increase_log_size(&log_arr);
         }
 
@@ -794,7 +709,7 @@ void *send_append_entries_rpc(void *arg){
         rc = send(sock, &message, sizeof(message), 0);
         if (rc <= 0) {
             perror("ошибка вызова send");
-            safe_leave(sock, mutex, -1);
+            safe_leave(sock, NULL, -1);
             return ((void *)EXIT_FAILURE);
         }
         printf("Send success\n");
@@ -803,7 +718,8 @@ void *send_append_entries_rpc(void *arg){
         rc = recv(sock, &response, sizeof(response), 0);
         if (rc <= 0) {
             perror("ошибка вызова recv");
-            safe_leave(sock, mutex, -1);
+            safe_leave(sock, NULL, -1);
+            flsh();
             return ((void *)EXIT_FAILURE);
         }
 
@@ -833,7 +749,7 @@ void *send_append_entries_rpc(void *arg){
     }
 
     flsh();
-    safe_leave(sock, mutex, -1);
+    safe_leave(sock, NULL, -1);
     return ((void *)EXIT_SUCCESS);
 }
 
@@ -844,12 +760,13 @@ void *send_append_entries_rpc_to_all(){
     pthread_mutex_t mutexes[NUMBER_OF_PORTS];
     pthread_mutex_t mtx;
     pthread_mutex_init(&mtx, NULL);
+    printf("Lock mtx in send_append_entries_rpc_to_all\n");
     pthread_mutex_lock(&mtx);
 
     for (i = 0; i < NUMBER_OF_PORTS; i++){
         if (i == SERVER_ID){ continue; }
         mutex_id_t mutex_id = {
-            .mutex = &mutexes[i],
+            // .mutex = &mutexes[i],
             .mtx = &mtx,
             .id = i,
         };
@@ -858,10 +775,12 @@ void *send_append_entries_rpc_to_all(){
         if (rc != 0){
             perror("Error in creating thread in send_append_entries_rpc_to_all");
         }
+        printf("Lock mtx in send_append_entries_rpc_to_all\n");        
         pthread_mutex_lock(&mtx);
     }
     for (i = 0; i < NUMBER_OF_PORTS; i++){
         if (i == SERVER_ID){ continue; }
+        printf("Waiting for %d thread to finish\n", i);
         pthread_join(threads[i], NULL);
     }
 }
@@ -922,7 +841,7 @@ void *try_get_rpc(void *arg){
         // socklen_t client_name_len;
         // int fd = accept(sock, &client_name, &client_name_len);
         int rc;
-        printf("Locking vote mutex in handle_rpc\n");
+        printf("Locking %p vote mutex in try_get_rpc\n", (void *)vote_mutex);
         pthread_mutex_lock(vote_mutex);
 
         int fd = accept(sock, NULL, NULL);
@@ -947,7 +866,7 @@ void *try_get_rpc(void *arg){
             printf("Initiate election because of timeout\n");
             initiate_election();
         }
-        printf("Unlocking vote mutex in handle_rpc\n");
+        // printf("Unlocking vote mutex in try_get_rpc\n");
         safe_leave(fd, vote_mutex, -1);
     }
 
@@ -961,9 +880,8 @@ void *wrap_try_get_rpc(void *arg){
     printf("wrap try get rpc -------------------v %d\n", params.ind);
     pthread_mutex_t *mutex = &_params->mutex;
     int rc;
-    printf("Locking mutex in wrap_try_get_rpc\n");
+    printf("Lock mutex %p in wrap_try_get_rpc\n", (void *)mutex);
     pthread_mutex_lock(mutex);
-    printf("Mutex is locked\n");
 
     struct sockaddr_in local;
     // tuning the server
@@ -1043,7 +961,7 @@ void *respond_to_client(entry_t entry){
     }
 
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-    int rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
+    rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer)); 
     if (rc != 0) {
         perror("ошибка вызова connect");
         safe_leave(sock, NULL, -1);
@@ -1079,30 +997,22 @@ void apply(entry_t entry){
     printf("operation: %d, key: %s, value: %s\n", query.operation, query.key, query.value);
     switch (query.operation) {
         case OP_ERASE:
-            entry.response = map.rem(map, query.key);
+            entry.response = map.rem(&map, query.key);
             break;
         case OP_SET:
-            entry.response = map.set(map, query.key, query.value);
+            entry.response = map.set(&map, query.key, query.value);
             break;
         case OP_GET:
-            entry.response = map.get(map, query.key);
+            entry.response = map.get(&map, query.key);
             break;
     }
 
     // send response
-    if (State == Leader){
+    if (entry.received_by == SERVER_ID){
+        printf("Responding to client\n");
         respond_to_client(entry);
     }
 }
-
-// void *update_client(pthread_mutex_t *client_mutex){
-    // printf("Update client\n");
-    // respond_to_client();
-    // pthread_t thread;
-    // pthread_mutex_lock(client_mutex);
-    // pthread_create(&thread, NULL, respond_to_client, NULL);
-    // pthread_mutex_unlock(client_mutex);
-// }
 
 int run_server(config_t *config) {
     printf("Running %d\n", config->port);
@@ -1209,18 +1119,15 @@ int run_server(config_t *config) {
                     pthread_create(&thread, NULL, wrap_try_get_rpc, &params);
 
                     timestamp();
-                    
-                    if (State != Leader){ break; }
-                    update_client(&client_mutex);
-                    
+
                     // simulate incoming message from client (append entry by now)
                     if (State != Leader){ break; }
-                    entry_t entry = make_entry(gen_command(), current_term, log_arr.last);
-                    push_back(&log_arr, entry);
-                    printf("===========\n");
-                    printf("Generated entry\n");
-                    print_entry(entry);
-                    printf("===========\n");
+                    // entry_t entry = make_entry(gen_command(), current_term, log_arr.last);
+                    // push_back(&log_arr, entry);
+                    // printf("===========\n");
+                    // printf("Generated entry\n");
+                    // print_entry(entry);
+                    // printf("===========\n");
                     
                     // leader actions
                     send_append_entries_rpc_to_all();
@@ -1261,6 +1168,8 @@ int run_server(config_t *config) {
     }
 
     print_log(log_arr);
+    tree_hash_map_print(&map);
+    printf("Last commited: %d\n", commit_index);
     return (EXIT_SUCCESS);
 }
 
@@ -1287,7 +1196,8 @@ int parse_str(int *num, char *str){
 
 void intHandler(int smt){
     print_log(log_arr);
-    tree_hash_map_print(&map);
+    // tree_hash_map_print(&map);
+    printf("Last commited: %d\n", commit_index);
     printf("Error code %d\n", smt);
     exit(1);
 }

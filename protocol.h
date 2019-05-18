@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/select.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +87,7 @@ typedef struct entry_committed_t {
 typedef struct entry_t {
     int term;
     int index;
+    int received_by;
     command_t command;
     response_t response;
 } entry_t;
@@ -96,7 +98,6 @@ typedef struct log_arr_t {
     entry_t *entries;
 } log_arr_t;
 
-log_arr_t log_arr;
 
 int send_prep_message(int sock, type_e type, whom_e whom, int from);
 
@@ -112,3 +113,16 @@ void print_log(log_arr_t logg);
 
 char *gen_str(int size);
 command_t gen_command();
+
+void push_back(log_arr_t *logg, entry_t entry);
+float rand_in_range(float a, float b);
+void mysleep(int ms);
+void flsh();
+void timestamp();
+/* return time spent in seconds */
+double time_spent_time(time_t start_time);
+int eq_command(const command_t a, const command_t b);
+int eq_entries(const entry_t a, const entry_t b);
+void increase_log_size(log_arr_t *logg);
+int safe_leave(int sock, pthread_mutex_t *mutex, int ind);
+entry_t make_entry(command_t command, int term, int index, int received_by);

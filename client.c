@@ -3,11 +3,13 @@
 
 #define IP_ADDR ("127.0.0.1")
 #define RECV_TIMEOUT (2)         // in seconds
-#define CLIENT_SELECT_TIMEOUT (100)    // in seconds
+#define CLIENT_SELECT_TIMEOUT (300)    // in seconds
 int leader_id = 0;
 int KNOWN_PORTS[NUMBER_OF_PORTS] = {7500, 7501, 7502};
 
 whom_e State = Client;
+log_arr_t log_sent;
+log_arr_t log_received;
 
 struct timespec select_timeout = {
     .tv_sec = CLIENT_SELECT_TIMEOUT,
@@ -19,6 +21,12 @@ struct timeval recv_timeout = {
     .tv_usec = 0,
 };
 
+void push_back(log_arr_t *logg, entry_t entry){
+    if (logg->last == logg->size){
+        increase_log_size(logg);
+    }
+    logg->entries[logg->last++] = entry;
+}
 
 void *print_response(response_t response){
     printf("value %s, answer %s\n", response.value, response.answer);
@@ -28,8 +36,40 @@ void *print_entry_committed(entry_committed_t entry){
     printf("----------------\n");
     printf("Entry committed\n");
     printf("Term %d, index %d, committed %d\n", entry.term, entry.index, entry.committed);
-    printf_response(entry.response);
+    print_response(entry.response);
     printf("----------------\n");
+}
+
+
+int send_prep_message(int sock, type_e type, whom_e whom, int from){
+    prepare_message_t prep_message = { 
+        .type = type,
+        .whom = whom,
+        .from = from,
+        .term = -1,
+    };
+    int rc;
+    //MSG_NOSIGNAL to ifnore SIGPIPE - 141 - writing to a closed socket
+    rc = send(sock, &prep_message, sizeof(prep_message), MSG_NOSIGNAL);
+    if (rc <= 0){
+        perror("Error in send in send prep message");
+        return (EXIT_FAILURE);
+    }
+    printf("Send success\n");
+    prepare_message_client_t prep_response;
+    memset(&prep_response, 0, sizeof(prep_response));
+    rc = recv(sock, &prep_response, sizeof(prep_response), 0);
+    if (rc <= 0){
+        perror("Error in recv in send prep message");
+        return (EXIT_FAILURE);
+    }
+
+    leader_id = prep_response.leader_id;
+    if (!prep_response.ready){
+        return (EXIT_FAILURE);
+    }
+
+    return (EXIT_SUCCESS);
 }
 
 void *wait_for_response(){
@@ -40,10 +80,11 @@ void *wait_for_response(){
     local.sin_port = htons(CLIENT_PORT);
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     
+    int rc;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         perror ("ошибка вызова socket");
-        safe_leave(sock, mutex, params.ind);
+        safe_leave(sock, NULL, -1);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -51,24 +92,25 @@ void *wait_for_response(){
     // when address becomes available to bind again. Thus, make it reusable to
     // not get "Address already in use" error.
     // https://hea-www.harvard.edu/~fine/Tech/addrinuse.html
-    // int enable = 1;
-    // rc = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
-    // if (rc < 0){
-    //     perror("setsockopt(SO_REUSEADDR) failed");
-    //     safe_leave(sock, mutex, params.ind);
-    //     return ((void *)EXIT_FAILURE);
-    // }
+    int enable = 1;
+    rc = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
+    if (rc < 0){
+        perror("setsockopt(SO_REUSEADDR) failed");
+        safe_leave(sock, NULL, -1);
+        return ((void *)EXIT_FAILURE);
+    }
 
     // make socket non blocking to wait no more than %d seconds
     rc = fcntl(sock, F_SETFL, O_NONBLOCK);
     if (rc < 0){
         perror("Error in fcntl");
-        safe_leave(sock, mutex, params.ind);
+        safe_leave(sock, NULL, -1);
         return ((void *)EXIT_FAILURE);
     }
     rc = bind(sock, (struct sockaddr *)&local, sizeof(local));
     if (rc < 0) {
         perror("ошибка вызова bind in wrap!");
+        safe_leave(sock, NULL, -1);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -76,10 +118,11 @@ void *wait_for_response(){
     rc = listen(sock, 1);
     if (rc) {
         perror("ошибка вызова listen");
+        safe_leave(sock, NULL, -1);
         return ((void *)EXIT_FAILURE);
     }
 
-    d_set sockets;
+    fd_set sockets;
     FD_ZERO(&sockets);  //clear set
     FD_SET(sock, &sockets); //add sock to set
 
@@ -88,6 +131,7 @@ void *wait_for_response(){
     printf("Select %d\n", sel);
     if (sel <= 0){
         perror("Ошибка select");
+        safe_leave(sock, NULL, -1);
         return ((void *)EXIT_FAILURE);
     }
 
@@ -100,18 +144,21 @@ void *wait_for_response(){
         rc = recv(fd, &committed, sizeof(committed), 0);
         if (rc <= 0){
             perror("Error in recv");
-            return (EXIT_FAILURE);
+            safe_leave(sock, NULL, -1);
+            return ((void *)EXIT_FAILURE);
         }
 
         print_entry_committed(committed);
     }
+    safe_leave(sock, NULL, -1);
+    return ((void *)EXIT_SUCCESS);
 }
 
-void *run_client(){
-
+int run_client(){
     while(1){
         //generate new command every %d seconds
-        sleep(5);
+        printf("Sleeping\n");
+        mysleep(2000);
         // connecting to server
         struct sockaddr_in peer;
         peer.sin_family = AF_INET;
@@ -125,20 +172,21 @@ void *run_client(){
         sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
             perror("ошибка вызова socket");
-            return ((void *)EXIT_FAILURE);
+            return (EXIT_FAILURE);
         }
 
         rc = connect(sock, (struct sockaddr *)&peer, sizeof(peer));
         if (rc > 0) {
             perror("ошибка вызова connect");
-            return ((void *)EXIT_FAILURE);        
+            return (EXIT_FAILURE);        
         }
         // if connection is successful print it
-        printf("Connected %d\n", client_params.id);
+        printf("Connected\n");
         
         rc = send_prep_message(sock, Operation, State, CLIENT_PORT);
-        if (rc != EXIT_SUCCESS){
-            perror("error in send prep message")
+        if (rc != EXIT_SUCCESS || leader_id == -1){
+            leader_id = rand() % 3;
+            close(sock);
             continue;
         }
 
@@ -146,7 +194,7 @@ void *run_client(){
         rc = send(sock, &command, sizeof(command), 0);
         if (rc <= 0) {
             perror("ошибка вызова send");
-            return ((void *)EXIT_FAILURE);
+            return (EXIT_FAILURE);
         }
         printf("Sent success\n");
 
@@ -154,16 +202,28 @@ void *run_client(){
         rc = recv(sock, &response, sizeof(response), 0);
         if (rc <= 0) {
             perror("ошибка вызова recv");
-            return ((void *)EXIT_FAILURE);
+            return (EXIT_FAILURE);
         }
         
+        push_back(&log_sent, make_entry(command, response.term, response.index, -1));
         printf("Recv success term: %d, index: %d\n", response.term, response.index);
         close(sock);
 
         wait_for_response();
     }
-    return ((void *)EXIT_SUCCESS);
+    print_log(log_sent);
+    print_log(log_received);
+    return (EXIT_SUCCESS);
 }
+
+void intHandler(int smt){
+    print_log(log_sent);
+    print_log(log_received);
+    printf("Error code %d\n", smt);
+    exit(1);
+}
+
+
 
 int main(int argc, char * argv[]) {
     srand(time(NULL));
